@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  agent-server:
+    build: ./server
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HEARTBEAT_TIMEOUT=90000
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped

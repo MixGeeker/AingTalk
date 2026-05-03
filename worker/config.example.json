@@ -1,0 +1,13 @@
+{
+  "serverUrl": "http://localhost:3000",
+  "name": "调试用机器",
+  "workDir": "/Users/dev/projects",
+  "heartbeatInterval": 30000,
+  "autoReconnect": true,
+  "reconnectInterval": 5000,
+  "maxReconnectAttempts": 10,
+  "claudeCodePath": "claude",
+  "maxFileSize": 104857600,
+  "allowedFileTypes": [".zip", ".tar.gz", ".tgz", ".js", ".ts", ".py", ".json", ".md", ".txt", ".log", ".yaml", ".yml"],
+  "capabilities": ["claude-code", "node", "git"]
+}
