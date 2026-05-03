@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# commit-msg hook: 检查 commit message 是否包含中文，不含中文则拒绝提交。
+
+COMMIT_MSG_FILE="$1"
+
+# 读取提交信息（跳过 # 开头的注释行）
+MSG=$(grep -v '^#' "$COMMIT_MSG_FILE" | sed '/^$/d')
+
+if [ -z "$MSG" ]; then
+  echo ""
+  echo "❌ 错误: commit message 不能为空"
+  echo ""
+  exit 1
+fi
+
+# 检查是否包含中文字符 (CJK 统一表意文字)
+if echo "$MSG" | grep -qP '[\x{4e00}-\x{9fff}\x{3400}-\x{4dbf}]'; then
+  exit 0
+fi
+
+echo ""
+echo "❌ 错误: commit message 必须包含中文"
+echo "   当前内容: $MSG"
+echo "   请使用中文描述本次提交内容。"
+echo ""
+exit 1
