@@ -19,6 +19,11 @@ export const useSocketStore = defineStore('socket', () => {
   const currentAgentId = ref(null)
   const latency = ref(0)
   const connectionError = ref(null)
+  const claudeTasks = ref({})
+
+  // Claude output callbacks (component-level, not reactive)
+  let _claudeOutputCallbacks = []
+  let _claudeCompleteCallbacks = []
 
   // ========== Getters ==========
   const onlineAgents = computed(() => agents.value.filter(a => a.status === 'online' || a.status === 'idle'))
@@ -200,6 +205,33 @@ export const useSocketStore = defineStore('socket', () => {
         latency.value = Date.now() - data.clientTime
       }
     })
+
+    // Claude Code streaming output
+    socket.value.on('claude:output', (data) => {
+      if (data?.taskId) {
+        if (!claudeTasks.value[data.taskId]) {
+          claudeTasks.value[data.taskId] = {
+            status: 'running',
+            startedAt: Date.now()
+          }
+        }
+        claudeTasks.value[data.taskId].lastChunkAt = Date.now()
+      }
+      _claudeOutputCallbacks.forEach(cb => {
+        try { cb(data) } catch (e) { /* don't break sibling callbacks */ }
+      })
+    })
+
+    socket.value.on('claude:complete', (data) => {
+      if (data?.taskId && claudeTasks.value[data.taskId]) {
+        claudeTasks.value[data.taskId].status = data.exitCode === 0 ? 'success' : 'error'
+        claudeTasks.value[data.taskId].duration = data.duration
+        claudeTasks.value[data.taskId].exitCode = data.exitCode
+      }
+      _claudeCompleteCallbacks.forEach(cb => {
+        try { cb(data) } catch (e) {}
+      })
+    })
   }
 
   function disconnect() {
@@ -312,6 +344,20 @@ export const useSocketStore = defineStore('socket', () => {
     return true
   }
 
+  function onClaudeOutput(fn) {
+    _claudeOutputCallbacks.push(fn)
+    return () => {
+      _claudeOutputCallbacks = _claudeOutputCallbacks.filter(c => c !== fn)
+    }
+  }
+
+  function onClaudeComplete(fn) {
+    _claudeCompleteCallbacks.push(fn)
+    return () => {
+      _claudeCompleteCallbacks = _claudeCompleteCallbacks.filter(c => c !== fn)
+    }
+  }
+
   // ========== Helpers ==========
 
   function updateStats() {
@@ -363,6 +409,9 @@ export const useSocketStore = defineStore('socket', () => {
     joinDashboard,
     selectAgent,
     sendFile,
-    respondToFile
+    respondToFile,
+    claudeTasks,
+    onClaudeOutput,
+    onClaudeComplete
   }
 })

@@ -67,6 +67,13 @@
           <ChatRoom />
         </div>
 
+        <!-- Claude Terminal (shown when agent is executing Claude Code) -->
+        <ClaudeTerminal
+          v-if="showClaudeTerminal"
+          :agent-id="store.currentAgentId"
+          class="flex-shrink-0 h-[340px] border-t border-slate-700"
+        />
+
         <!-- Status Monitor (collapsible bottom panel) -->
         <StatusMonitor />
       </main>
@@ -122,15 +129,25 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useSocketStore } from '@/stores/socket.js'
 import AgentList from '@/components/AgentList.vue'
 import ChatRoom from '@/components/ChatRoom.vue'
 import StatusMonitor from '@/components/StatusMonitor.vue'
+import ClaudeTerminal from '@/components/ClaudeTerminal.vue'
 
 const store = useSocketStore()
 const serverUrl = ref('')
 const isConnecting = ref(false)
+const showClaudeTerminal = ref(false)
+
+// Auto-show terminal when there's a running claude task
+watch(() => store.claudeTasks, (tasks) => {
+  const hasRunning = Object.values(tasks).some(t => t.status === 'running')
+  if (hasRunning) {
+    showClaudeTerminal.value = true
+  }
+}, { deep: true })
 
 function connect() {
   isConnecting.value = true
