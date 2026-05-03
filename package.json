@@ -3,13 +3,17 @@
   "version": "1.0.0",
   "description": "Multi-Agent 联调测试基建系统 - Socket.io 聊天室",
   "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "install:all": "cd server && npm install && cd ../worker && npm install && cd ../frontend && npm install",
-    "dev:server": "cd server && npm run dev",
-    "dev:frontend": "cd frontend && npm run dev",
-    "start:worker": "cd worker && npm start",
-    "build:frontend": "cd frontend && npm run build",
-    "docker:build": "docker-compose build",
-    "docker:up": "docker-compose up -d"
+    "install:all": "pnpm install",
+    "dev:server": "pnpm -F agent-collab-server dev",
+    "dev:frontend": "pnpm -F agent-collab-frontend dev",
+    "start:worker": "pnpm -F agent-collab-worker start",
+    "build:frontend": "pnpm -F agent-collab-frontend build",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d"
   }
 }

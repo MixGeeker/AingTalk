@@ -10,22 +10,22 @@ AingTalk is a Socket.io-based multi-agent collaboration platform for joint debug
 
 ```bash
 # Install all dependencies (root)
-npm run install:all
+pnpm install
 
 # Server (port 3000)
-npm run dev:server          # nodemon auto-restart
-cd server && npm start      # direct start
+pnpm dev:server             # nodemon auto-restart
+cd server && pnpm start     # direct start
 
 # Worker (connects to server)
-cd worker && npm start
+cd worker && pnpm start
 cd worker && node src/index.js --server http://localhost:3000 --name "MyMachine" --workDir /path/to/projects
 
 # Frontend dev server (port 5173, proxies /api and /socket.io to :3000)
-npm run dev:frontend
-cd frontend && npm run build   # outputs to frontend/dist/
+pnpm dev:frontend
+cd frontend && pnpm build      # outputs to frontend/dist/
 
 # Docker
-npm run docker:up
+pnpm docker:up
 docker-compose up -d
 ```
 

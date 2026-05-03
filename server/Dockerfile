@@ -2,9 +2,11 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
+
 COPY package.json ./
 
-RUN npm install --production
+RUN pnpm install --prod
 
 COPY src/ ./src/
 COPY public/ ./public/
