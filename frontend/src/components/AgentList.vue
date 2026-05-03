@@ -358,7 +358,7 @@ function closeRoleDialog() {
 }
 
 function confirmRole() {
-  if (!roleDialog.value.roleName.trim()) return
+  if (!roleDialog.value.agent || !roleDialog.value.roleName.trim()) return
   store.assignRole(
     roleDialog.value.agent.id,
     roleDialog.value.roleName.trim(),

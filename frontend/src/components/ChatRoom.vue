@@ -227,7 +227,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { useSocketStore } from '@/stores/socket.js'
-import { getPlatformIcon } from '@/utils/format.js'
+import { getPlatformIcon, getStatusDotClass } from '@/utils/format.js'
 import MessagePanel from './MessagePanel.vue'
 import FileTransfer from './FileTransfer.vue'
 
@@ -258,6 +258,14 @@ watch(() => store.currentMessages.length, async () => {
   scrollToBottom()
 })
 
+// Reset BTW state when switching agents
+watch(() => store.currentAgentId, () => {
+  btwMessage.value = ''
+  btwUrgency.value = 'normal'
+  showBtwInput.value = false
+  inputMessage.value = ''
+})
+
 onMounted(() => {
   scrollToBottom()
 })
@@ -270,10 +278,7 @@ function scrollToBottom() {
 
 // Input handling
 function handleInput(e) {
-  const el = e.target
-  el.style.height = 'auto'
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px'
-  inputHeight.value = Math.min(el.scrollHeight, 120)
+  inputHeight.value = Math.min(e.target.scrollHeight, 120)
 
   // Check for @ mention
   const cursorPos = el.selectionStart
@@ -327,9 +332,6 @@ function sendMessage() {
 
   inputMessage.value = ''
   inputHeight.value = 40
-  if (messageInput.value) {
-    messageInput.value.style.height = '40px'
-  }
 }
 
 function sendBtw() {
@@ -350,9 +352,9 @@ function handleDragOver() {
   isDragging.value = true
 }
 
-function handleDragLeave() {
-  dragCounter.value--
-  if (dragCounter.value <= 0) {
+function handleDragLeave(e) {
+  // 仅在真正离开容器时重置
+  if (!messagesContainer.value || e.relatedTarget === null || !messagesContainer.value.contains(e.relatedTarget)) {
     isDragging.value = false
     dragCounter.value = 0
   }
@@ -361,6 +363,9 @@ function handleDragLeave() {
 function handleDrop(e) {
   isDragging.value = false
   dragCounter.value = 0
+  if (e.dataTransfer.items) {
+    e.dataTransfer.items.clear()
+  }
   const files = e.dataTransfer.files
   if (files.length > 0 && store.selectedAgent) {
     // Trigger file transfer with dropped files
@@ -372,16 +377,4 @@ function handleDrop(e) {
   }
 }
 
-// Status dot helper
-function getStatusDotClass(status) {
-  const map = {
-    online: 'bg-green-400',
-    idle: 'bg-green-400',
-    busy: 'bg-yellow-400',
-    error: 'bg-red-400',
-    offline: 'bg-gray-600',
-    disconnected: 'bg-gray-600'
-  }
-  return map[status] || 'bg-gray-600'
-}
 </script>

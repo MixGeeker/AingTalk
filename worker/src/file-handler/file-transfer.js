@@ -25,6 +25,7 @@ class FileTransfer extends EventEmitter {
       '.md', '.txt', '.log', '.yaml', '.yml'
     ];
 
+    this.maxConcurrentTransfers = options.maxConcurrentTransfers || 5;
     // 接收中的文件: fileId -> { chunks: Buffer[], received: Set, totalChunks, name, size }
     this.receivingFiles = new Map();
     // 发送中的文件: fileId -> { path, name, totalChunks, chunksSent: Set }
@@ -62,6 +63,7 @@ class FileTransfer extends EventEmitter {
       size: fileSize,
       totalChunks,
       chunksSent: new Set(),
+      startedAt: Date.now(),
       to
     });
 
@@ -125,6 +127,12 @@ class FileTransfer extends EventEmitter {
    * @returns {Object} 接收状态
    */
   receiveFile(fileId, name, totalChunks) {
+    // 限制并发接收数
+    const activeReceives = [...this.receivingFiles.values()].filter(f => !f.completed).length;
+    if (activeReceives >= this.maxConcurrentTransfers) {
+      throw new Error(`并发接收数已达上限 (${this.maxConcurrentTransfers})`);
+    }
+
     // 验证文件名和类型
     const validation = this.#validateFileName(name);
     if (!validation.valid) {
@@ -158,7 +166,7 @@ class FileTransfer extends EventEmitter {
   }
 
   /**
-   * 处理接收到的文件块
+   * 处理接收到的文件块（按 index 缓存，全部到齐后按序写入）
    * @param {string} fileId - 文件 ID
    * @param {number} index - 块索引
    * @param {string} data - Base64 编码的块数据
@@ -180,33 +188,46 @@ class FileTransfer extends EventEmitter {
     }
 
     try {
-      // 解码并写入
+      // 按 index 缓存块数据
       const buffer = Buffer.from(data, 'base64');
 
-      // 使用流式写入：追加到文件
-      fs.appendFileSync(fileInfo.path, buffer);
+      // 检查总大小不超限
+      const currentTotal = fileInfo.chunks.reduce((sum, c) => sum + (c ? c.length : 0), 0) + buffer.length;
+      if (currentTotal > this.maxFileSize) {
+        return { success: false, error: '文件大小超出限制', complete: false };
+      }
 
+      fileInfo.chunks[index] = buffer;
       fileInfo.receivedChunks.add(index);
       const progress = this.#getProgress(fileInfo);
 
       this.emit('chunk:received', { fileId, index, progress });
 
-      // 检查是否接收完成
+      // 全部收齐后按序写入
       if (fileInfo.receivedChunks.size === fileInfo.totalChunks) {
+        // 按索引顺序拼接所有块
+        const orderedBuffers = [];
+        for (let i = 0; i < fileInfo.totalChunks; i++) {
+          if (fileInfo.chunks[i]) {
+            orderedBuffers.push(fileInfo.chunks[i]);
+          }
+        }
+        const fullBuffer = Buffer.concat(orderedBuffers);
+        fs.writeFileSync(fileInfo.path, fullBuffer);
+
         fileInfo.completed = true;
         fileInfo.endTime = Date.now();
         fileInfo.duration = fileInfo.endTime - fileInfo.startTime;
+        fileInfo.finalSize = fullBuffer.length;
+        fileInfo.chunks = null; // 释放缓存
 
-        const stats = fs.statSync(fileInfo.path);
-        fileInfo.finalSize = stats.size;
-
-        console.log(`[FileTransfer] 文件接收完成: ${fileInfo.name} (${this.#formatBytes(stats.size)}, ${fileInfo.duration}ms)`);
+        console.log(`[FileTransfer] 文件接收完成: ${fileInfo.name} (${this.#formatBytes(fullBuffer.length)}, ${fileInfo.duration}ms)`);
 
         this.emit('file:received', {
           fileId,
           name: fileInfo.name,
           path: fileInfo.path,
-          size: stats.size,
+          size: fullBuffer.length,
           duration: fileInfo.duration
         });
 
@@ -312,13 +333,21 @@ class FileTransfer extends EventEmitter {
     const maxAge = 30 * 60 * 1000; // 30 分钟
 
     for (const [fileId, fileInfo] of this.receivingFiles) {
+      // 清理已完成或卡住超过 30 分的任务
       if (fileInfo.completed && (now - fileInfo.endTime) > maxAge) {
         this.receivingFiles.delete(fileId);
+      } else if (!fileInfo.completed && (now - fileInfo.startTime) > maxAge) {
+        // 卡住的传输：删除部分文件
+        try { if (fs.existsSync(fileInfo.path)) fs.unlinkSync(fileInfo.path); } catch (e) { /* ignore */ }
+        this.receivingFiles.delete(fileId);
+        console.warn(`[FileTransfer] 清理卡住的接收任务: ${fileInfo.name} (${fileId})`);
       }
     }
 
     for (const [fileId, fileInfo] of this.sendingFiles) {
       if (fileInfo.chunksSent.size === fileInfo.totalChunks) {
+        this.sendingFiles.delete(fileId);
+      } else if ((now - (fileInfo.startedAt || 0)) > maxAge) {
         this.sendingFiles.delete(fileId);
       }
     }
@@ -376,6 +405,18 @@ class FileTransfer extends EventEmitter {
   #validateFileName(fileName) {
     // 安全检查：防止路径遍历
     if (fileName.includes('..') || fileName.includes('/') || fileName.includes('\\')) {
+      return { valid: false, error: '文件名包含非法字符' };
+    }
+
+    // Windows 保留设备名检查
+    const winReserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i;
+    const baseName = fileName.split('.')[0];
+    if (winReserved.test(baseName)) {
+      return { valid: false, error: '文件名包含保留设备名' };
+    }
+
+    // 禁止 NTFS 数据流
+    if (fileName.includes(':$')) {
       return { valid: false, error: '文件名包含非法字符' };
     }
 

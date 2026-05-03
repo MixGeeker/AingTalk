@@ -93,12 +93,12 @@ export const useSocketStore = defineStore('socket', () => {
         agents.value[idx] = { ...agents.value[idx], ...data, status: 'online' }
       } else {
         agents.value.push({
+          ...data,
           id: data.agentId,
           name: data.name,
           role: data.role || '',
           platform: data.platform,
-          status: 'online',
-          ...data
+          status: 'online'
         })
       }
       updateStats()
@@ -128,10 +128,14 @@ export const useSocketStore = defineStore('socket', () => {
       updateStats()
     })
 
-    // New message
+    // New message - merge server version over optimistic local
     socket.value.on('message:new', (data) => {
       const message = data.message || data
-      if (message && !messages.value.find(m => m.id === message.id)) {
+      if (!message || !message.id) return
+      const idx = messages.value.findIndex(m => m.id === message.id)
+      if (idx >= 0) {
+        messages.value[idx] = { ...messages.value[idx], ...message }
+      } else {
         messages.value.push(message)
         systemStats.value.totalMessages++
       }
@@ -190,16 +194,17 @@ export const useSocketStore = defineStore('socket', () => {
       systemStats.value = { ...systemStats.value, ...data }
     })
 
-    // Heartbeat ack (for latency calculation)
+    // Heartbeat ack (RTT latency calculation using echoed client time)
     socket.value.on('heartbeat:ack', (data) => {
-      if (data.serverTime) {
-        latency.value = Date.now() - data.serverTime
+      if (data.clientTime) {
+        latency.value = Date.now() - data.clientTime
       }
     })
   }
 
   function disconnect() {
     if (socket.value) {
+      socket.value.removeAllListeners()
       socket.value.disconnect()
       socket.value = null
     }

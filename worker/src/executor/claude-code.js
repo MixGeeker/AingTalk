@@ -142,17 +142,21 @@ class ClaudeCodeExecutor extends EventEmitter {
       let timedOut = false;
 
       if (timeout > 0) {
+        let forceKill = null;
         timeoutTimer = setTimeout(() => {
           timedOut = true;
           console.warn(`[ClaudeCodeExecutor] 任务 ${taskId} 超时，正在终止...`);
           child.kill('SIGTERM');
 
-          // 5秒后强制终止
-          setTimeout(() => {
+          // 5秒后强制终止，存储以便清理
+          forceKill = setTimeout(() => {
             if (!child.killed) {
               child.kill('SIGKILL');
             }
           }, 5000);
+          child.once('close', () => {
+            if (forceKill) clearTimeout(forceKill);
+          });
         }, timeout);
       }
 
@@ -226,12 +230,13 @@ class ClaudeCodeExecutor extends EventEmitter {
       console.log(`[ClaudeCodeExecutor] 取消任务 ${taskId}`);
       child.kill('SIGTERM');
 
-      // 5秒后强制终止
-      setTimeout(() => {
+      // 5 秒后强制终止，存储 timer 以便 close 时清理
+      const forceKill = setTimeout(() => {
         if (!child.killed) {
           child.kill('SIGKILL');
         }
       }, 5000);
+      child.once('close', () => clearTimeout(forceKill));
 
       this.activeTasks.delete(taskId);
       this.emit('task:cancelled', { taskId });
@@ -389,7 +394,7 @@ class ClaudeCodeExecutor extends EventEmitter {
    */
   #runCommand(args, options = {}) {
     return new Promise((resolve, reject) => {
-      const { timeout = 30000, cwd = this.workDir, streaming = true } = options;
+      const { timeout = 30000, cwd = this.workDir } = options;
       let stdout = '';
       let stderr = '';
 

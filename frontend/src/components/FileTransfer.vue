@@ -115,7 +115,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useSocketStore } from '@/stores/socket.js'
 import { formatFileSize } from '@/utils/format.js'
 
@@ -133,6 +133,28 @@ const fileInput = ref(null)
 const dropZone = ref(null)
 const isDragOver = ref(false)
 const localTransfers = ref([])
+const simIntervals = new Set()
+
+// 处理 chat:files-dropped 全局事件
+function handleChatFilesDropped(e) {
+  const files = e.detail
+  if (files && files.length) {
+    Array.from(files).forEach(file => processFile(file))
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('chat:files-dropped', handleChatFilesDropped)
+})
+
+onUnmounted(() => {
+  // 清理所有模拟进度定时器
+  for (const id of simIntervals) {
+    clearInterval(id)
+  }
+  simIntervals.clear()
+  window.removeEventListener('chat:files-dropped', handleChatFilesDropped)
+})
 
 const allowedExtensions = ['.zip', '.tar', '.gz', '.rar', '.7z', '.js', '.ts', '.jsx', '.tsx', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.cc', '.h', '.hpp', '.cs', '.rb', '.php', '.swift', '.kt', '.scala', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini', '.conf', '.sh', '.bat', '.ps1', '.sql', '.md', '.txt']
 const allowedMimeTypes = ['application/zip', 'application/x-tar', 'application/gzip', 'application/x-rar', 'application/x-7z-compressed', 'text/plain', 'application/json', 'application/xml']
@@ -141,7 +163,7 @@ const acceptTypes = allowedExtensions.join(',') + ',' + allowedMimeTypes.join(',
 const allowedTypesLabel = '压缩包 + 代码文件'
 
 const transferList = computed(() => {
-  const remote = store.currentTransfers.filter(t => t.agentId === props.agentId || t.to === props.agentId || t.from === props.agentId)
+  const remote = store.transfers.filter(t => t.to === props.agentId || t.from === props.agentId)
   return [...localTransfers.value, ...remote]
 })
 
@@ -210,8 +232,8 @@ function simulateProgress(fileId) {
   let progress = 0
   const interval = setInterval(() => {
     const t = localTransfers.value.find(x => x.id === fileId)
-    if (!t) { clearInterval(interval); return }
-    if (t.status === 'cancelled' || t.status === 'error') { clearInterval(interval); return }
+    if (!t) { clearInterval(interval); simIntervals.delete(interval); return }
+    if (t.status === 'cancelled' || t.status === 'error') { clearInterval(interval); simIntervals.delete(interval); return }
 
     progress += Math.random() * 20
     if (progress >= 100) {
@@ -219,11 +241,13 @@ function simulateProgress(fileId) {
       t.progress = 100
       t.status = 'completed'
       clearInterval(interval)
+      simIntervals.delete(interval)
     } else {
       t.progress = Math.round(progress)
       t.status = 'transferring'
     }
   }, 500)
+  simIntervals.add(interval)
 }
 
 function cancelTransfer(fileId) {

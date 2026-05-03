@@ -152,6 +152,7 @@ const isOwn = computed(() => {
 const senderName = computed(() => {
   if (props.message.from === 'system') return '系统'
   if (props.message.from === 'dashboard') return '我'
+  if (props.message.from === store.socket?.id) return '我'
   const agent = store.agents.find(a => a.id === props.message.from)
   return agent?.name || props.message.from?.slice(0, 8) || 'Unknown'
 })

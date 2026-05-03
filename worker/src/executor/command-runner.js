@@ -169,6 +169,14 @@ class CommandRunner extends EventEmitter {
     const child = this.activeProcesses.get(processId);
     if (child) {
       child.kill(signal);
+      // SIGTERM 后 5 秒仍未退出则强制 SIGKILL
+      const killTimer = setTimeout(() => {
+        if (!child.killed) {
+          child.kill('SIGKILL');
+        }
+      }, 5000);
+      // 进程退出时清理 timer
+      child.once('close', () => clearTimeout(killTimer));
       this.activeProcesses.delete(processId);
       return true;
     }
@@ -182,8 +190,14 @@ class CommandRunner extends EventEmitter {
   cancelAll(signal = 'SIGTERM') {
     for (const [processId, child] of this.activeProcesses) {
       child.kill(signal);
-      this.activeProcesses.delete(processId);
+      const killTimer = setTimeout(() => {
+        if (!child.killed) {
+          child.kill('SIGKILL');
+        }
+      }, 5000);
+      child.once('close', () => clearTimeout(killTimer));
     }
+    this.activeProcesses.clear();
   }
 
   /**

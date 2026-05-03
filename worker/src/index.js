@@ -21,8 +21,11 @@ const { SystemInfoCollector } = require('./collector/system-info');
 const { SocketClient } = require('./client/socket-client');
 const { ClaudeCodeExecutor } = require('./executor/claude-code');
 const { CommandRunner } = require('./executor/command-runner');
-const { FileTransfer } = require('./file-handler/file-transfer');
+const { FileTransfer, CHUNK_SIZE } = require('./file-handler/file-transfer');
 const { v4: uuidv4 } = require('uuid');
+
+// 从 FileTransfer 复用常量
+const FILE_CHUNK_SIZE = CHUNK_SIZE;
 
 // ==================== 命令行参数解析 ====================
 
@@ -222,8 +225,15 @@ class Worker {
       console.error('[Worker] 启动失败:', error.message);
 
       if (this.config.autoReconnect) {
-        console.log('[Worker] 将在 5 秒后重试...');
-        setTimeout(() => this.start(), 5000);
+        this.retryCount = this.retryCount || 0;
+        if (this.retryCount >= 5) {
+          console.error('[Worker] 达到最大重试次数 (5)，停止重试');
+          process.exit(1);
+        }
+        this.retryCount++;
+        const delay = 5000 * Math.pow(2, this.retryCount - 1); // 指数退避
+        console.log(`[Worker] 将在 ${Math.round(delay / 1000)} 秒后第 ${this.retryCount} 次重试...`);
+        setTimeout(() => this.start(), delay);
       } else {
         process.exit(1);
       }
@@ -370,7 +380,20 @@ class Worker {
    * @private
    */
   async #handleClaudeExecute(data) {
+    if (!data || !data.taskId || !data.prompt) {
+      console.error('[Worker] Invalid claude:execute payload - missing taskId or prompt');
+      return;
+    }
+
     const { taskId, prompt, context, timeout } = data;
+
+    // 防止并发执行
+    if (this.status === 'busy') {
+      console.warn(`[Worker] Already busy, rejecting task ${taskId}`);
+      this.socketClient.sendClaudeOutput(taskId, '错误: Agent 正忙，请稍后再试\n', 'error');
+      this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Agent busy');
+      return;
+    }
 
     // 检查 Claude Code 是否可用
     if (!(await this.claudeExecutor.isAvailable())) {
@@ -456,7 +479,7 @@ class Worker {
       }
 
       // 接受文件
-      const fileInfo = this.fileTransfer.receiveFile(fileId, name, Math.ceil(size / (64 * 1024)));
+      const fileInfo = this.fileTransfer.receiveFile(fileId, name, Math.ceil(size / FILE_CHUNK_SIZE));
       this.socketClient.sendFileResponse(fileId, true);
       this.log(`已接受文件传输: ${name}`);
     } catch (error) {
@@ -502,8 +525,8 @@ class Worker {
     const interval = this.config.heartbeatInterval;
     console.log(`[Worker] 启动心跳定时器 (间隔: ${interval}ms)`);
 
-    this.heartbeatTimer = setInterval(async () => {
-      await this.#sendHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      this.#sendHeartbeat();
     }, interval);
 
     // 立即发送一次
@@ -536,7 +559,7 @@ class Worker {
         status: this.status,
         currentTask: this.currentTask ? this.currentTask.description : '',
         cpuUsage: metrics.cpuUsage,
-        memoryUsage: metrics.memoryUsage,
+        memoryUsage: metrics.memoryUsageMB,
         diskUsage: metrics.diskUsage,
         uptime: metrics.uptime
       });
@@ -568,9 +591,9 @@ class Worker {
     const logEntry = `[${timestamp}] ${message}`;
     this.recentLogs.push(logEntry);
 
-    // 限制日志数量
-    if (this.recentLogs.length > 100) {
-      this.recentLogs = this.recentLogs.slice(-50);
+    // 限制日志数量 (保留最近 100 条)
+    if (this.recentLogs.length > 200) {
+      this.recentLogs = this.recentLogs.slice(-100);
     }
 
     console.log(`[Worker] ${message}`);
@@ -586,9 +609,15 @@ class Worker {
 
       this.#stopHeartbeat();
 
-      // 取消所有正在执行的任务
+      // 取消所有正在执行的任务并等待子进程退出
       this.claudeExecutor?.cancelAll();
       this.commandRunner?.cancelAll();
+
+      // 短暂等待子进程清理（cancel 已发 SIGTERM，给 3 秒缓冲）
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // 清理文件传输
+      this.fileTransfer?.cleanup();
 
       // 断开连接
       this.socketClient?.disconnect();
@@ -609,15 +638,23 @@ class Worker {
       }).on('SIGINT', () => gracefulShutdown('SIGINT'));
     }
 
-    // 未捕获的异常
+    // 未捕获的异常 — 记录后退出，让进程管理器重启
     process.on('uncaughtException', (error) => {
       console.error('[Worker] 未捕获的异常:', error);
       this.log(`未捕获的异常: ${error.message}`);
+      this.#stopHeartbeat();
+      this.claudeExecutor?.cancelAll();
+      this.commandRunner?.cancelAll();
+      process.exit(1);
     });
 
     process.on('unhandledRejection', (reason, promise) => {
       console.error('[Worker] 未处理的 Promise 拒绝:', reason);
       this.log(`未处理的 Promise 拒绝: ${reason}`);
+      this.#stopHeartbeat();
+      this.claudeExecutor?.cancelAll();
+      this.commandRunner?.cancelAll();
+      process.exit(1);
     });
   }
 

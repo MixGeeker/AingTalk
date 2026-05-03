@@ -22,6 +22,17 @@ class MessageRouter {
         return { success: false, deliveredTo: [], error: 'Invalid message format' };
       }
 
+      // 非广播消息必须有 to 字段
+      if (message.to !== 'broadcast' && !message.to) {
+        console.warn('[MessageRouter] Missing "to" field for non-broadcast message:', message);
+        return { success: false, deliveredTo: [], error: 'Missing to field' };
+      }
+
+      // 限制消息内容大小 (1MB)
+      if (message.content && typeof message.content === 'string' && message.content.length > 1024 * 1024) {
+        return { success: false, deliveredTo: [], error: 'Message content too large (max 1MB)' };
+      }
+
       // 补充消息字段
       const enrichedMessage = {
         ...message,
@@ -29,7 +40,7 @@ class MessageRouter {
         delivered: false,
         deliveredAt: null,
         read: false,
-        timestamp: message.timestamp || Date.now()
+        timestamp: message.timestamp ?? Date.now()
       };
 
       // 存储消息
@@ -47,15 +58,18 @@ class MessageRouter {
       } else if (message.type === 'btw' || (message.metadata && message.metadata.isBtw)) {
         // BTW 旁路消息
         const success = this.sendBtwMessage(enrichedMessage);
-        if (success) deliveredTo = [message.to];
+        if (success) {
+          deliveredTo = [message.to];
+          this.confirmDeliveryToSender(message.from, enrichedMessage.id, message.to);
+        }
       } else {
         // 定向消息
         const success = this.sendTo(message.to, enrichedMessage);
-        if (success) deliveredTo = [message.to];
+        if (success) {
+          deliveredTo = [message.to];
+          this.confirmDeliveryToSender(message.from, enrichedMessage.id, message.to);
+        }
       }
-
-      // 给自己发送送达确认
-      this.confirmDeliveryToSender(message.from, enrichedMessage.id, message.to);
 
       // 向前端广播新消息
       this.io.emit('message:new', enrichedMessage);
@@ -73,12 +87,8 @@ class MessageRouter {
    * @param {string} excludeAgentId - 排除的 Agent ID
    */
   broadcast(message, excludeAgentId = null) {
+    // routeMessage 末尾的 io.emit 已覆盖前端；此处仅按 socket 投递到各 Agent（排除发送者）
     const excludeId = excludeAgentId || message.from;
-
-    // Socket.io 广播给所有连接
-    this.io.emit('message:new', message);
-
-    // 给每个在线 Agent 发送
     const agents = agentStore.getAllAgents();
     for (const agent of agents) {
       if (agent.id !== excludeId && agent.status !== 'offline') {

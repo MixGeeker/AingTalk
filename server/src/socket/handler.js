@@ -51,6 +51,10 @@ class SocketHandler {
 
     // Agent 主动断开
     socket.on('agent:disconnecting', (data) => {
+      if (!data || !data.agentId) {
+        console.warn('[Socket] Invalid agent:disconnecting payload');
+        return;
+      }
       console.log(`[Socket] Agent disconnecting: ${data.agentId}, reason: ${data.reason}`);
       this.agentManager.unregisterAgent(data.agentId, data.reason);
       this.heartbeatMonitor.removeAgent(data.agentId);
@@ -59,6 +63,10 @@ class SocketHandler {
     // ========== 心跳事件 ==========
 
     socket.on('heartbeat', (heartbeat) => {
+      if (!heartbeat || !heartbeat.agentId) {
+        console.warn('[Socket] Invalid heartbeat payload');
+        return;
+      }
       this.heartbeatMonitor.handleHeartbeat(heartbeat.agentId, heartbeat);
     });
 
@@ -96,20 +104,33 @@ class SocketHandler {
     // ========== Claude Code 事件 ==========
 
     socket.on('claude:output', (data) => {
-      console.log(`[Socket] Claude output for task ${data.taskId}: ${data.type}`);
-      // 转发 Claude Code 输出到前端
+      // 仅允许已注册的 Agent 发送 Claude 输出
+      const agent = this.agentManager.getAgentBySocketId(socket.id);
+      if (!agent) {
+        console.warn('[Socket] Unauthorized claude:output from', socket.id);
+        return;
+      }
+      console.log(`[Socket] Claude output for task ${data?.taskId}: ${data?.type}`);
       this.io.emit('claude:output', data);
     });
 
     socket.on('claude:complete', (data) => {
-      console.log(`[Socket] Claude complete for task ${data.taskId}, exitCode: ${data.exitCode}`);
-      // 转发 Claude Code 完成事件到前端
+      const agent = this.agentManager.getAgentBySocketId(socket.id);
+      if (!agent) {
+        console.warn('[Socket] Unauthorized claude:complete from', socket.id);
+        return;
+      }
+      console.log(`[Socket] Claude complete for task ${data?.taskId}, exitCode: ${data?.exitCode}`);
       this.io.emit('claude:complete', data);
     });
 
     // ========== Agent 状态报告 ==========
 
     socket.on('agent:status-report', (report) => {
+      if (!report || !report.agentId) {
+        console.warn('[Socket] Invalid agent:status-report payload');
+        return;
+      }
       const agent = agentStore.getAgent(report.agentId);
       if (agent) {
         // 更新 Agent 状态
@@ -136,7 +157,7 @@ class SocketHandler {
     // ========== 前端事件 ==========
 
     // 前端加入监控面板
-    socket.on('join-dashboard', () => {
+    socket.on('dashboard:join', () => {
       console.log(`[Socket] Dashboard joined: ${socket.id}`);
       // 发送当前 Agent 列表
       socket.emit('agent:list', this.agentManager.getAgents());
@@ -172,6 +193,10 @@ class SocketHandler {
 
     // 前端分配角色
     socket.on('assign-role', (data) => {
+      if (!data || !data.agentId || !data.role) {
+        console.warn('[Socket] Invalid assign-role payload');
+        return;
+      }
       console.log(`[Socket] Assign role to ${data.agentId}: ${data.role}`);
       const result = this.agentManager.assignRole(
         data.agentId,

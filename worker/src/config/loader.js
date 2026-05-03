@@ -60,14 +60,27 @@ class ConfigLoader {
     config = { ...config, ...envConfig };
 
     // 4. 从命令行参数加载（最高优先级）
-    config = { ...config, ...this.cliArgs };
+    // 只传递有效的运行时配置键，过滤 CLI 机械键
+    const runtimeCliArgs = {};
+    const validConfigKeys = new Set(Object.keys(DEFAULT_CONFIG));
+    for (const [key, value] of Object.entries(this.cliArgs)) {
+      if (validConfigKeys.has(key)) {
+        runtimeCliArgs[key] = value;
+      }
+    }
+    config = { ...config, ...runtimeCliArgs };
 
-    // 处理特殊值
-    config.name = config.name || os.hostname();
+    // 处理特殊值（NaN 守卫）
+    config.name = config.name ?? os.hostname();
+    if (!config.name) config.name = os.hostname();
     config.heartbeatInterval = parseInt(config.heartbeatInterval, 10);
+    if (Number.isNaN(config.heartbeatInterval) || config.heartbeatInterval < 1000) config.heartbeatInterval = DEFAULT_CONFIG.heartbeatInterval;
     config.reconnectInterval = parseInt(config.reconnectInterval, 10);
+    if (Number.isNaN(config.reconnectInterval) || config.reconnectInterval < 1000) config.reconnectInterval = DEFAULT_CONFIG.reconnectInterval;
     config.maxReconnectAttempts = parseInt(config.maxReconnectAttempts, 10);
+    if (Number.isNaN(config.maxReconnectAttempts) || config.maxReconnectAttempts < 0) config.maxReconnectAttempts = DEFAULT_CONFIG.maxReconnectAttempts;
     config.maxFileSize = parseInt(config.maxFileSize, 10);
+    if (Number.isNaN(config.maxFileSize) || config.maxFileSize <= 0) config.maxFileSize = DEFAULT_CONFIG.maxFileSize;
     config.autoReconnect = this.#parseBoolean(config.autoReconnect);
 
     // 处理 allowedFileTypes（支持字符串数组或逗号分隔字符串）

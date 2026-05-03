@@ -13,7 +13,7 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024;
 // 文件类型白名单
 const ALLOWED_EXTENSIONS = [
   // 压缩包
-  '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z',
+  '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z', '.tar.gz', '.tar.bz2',
   // 代码文件
   '.js', '.ts', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.h',
   // 数据文件
@@ -39,8 +39,7 @@ const ALLOWED_MIME_TYPES = [
   'text/csv',
   'text/x-sql',
   'text/markdown',
-  'text/xml',
-  'application/octet-stream'
+  'text/xml'
 ];
 
 // 禁止的文件类型
@@ -221,16 +220,11 @@ class FileHandler {
         return { success: false, error: 'Invalid chunk index' };
       }
 
-      // 存储块数据
-      if (!transfer.chunkData) {
-        transfer.chunkData = [];
-      }
-      transfer.chunkData[index] = data;
+      // 服务器仅转发，不存储块数据，避免内存堆积
       transfer.chunksReceived++;
 
       agentStore.updateFileTransfer(fileId, {
-        chunksReceived: transfer.chunksReceived,
-        chunkData: transfer.chunkData
+        chunksReceived: transfer.chunksReceived
       });
 
       // 发送块确认给发送方
@@ -274,10 +268,11 @@ class FileHandler {
     const transfer = agentStore.getFileTransfer(fileId);
     if (!transfer) return;
 
-    // 更新状态为完成
+    // 更新状态为完成，清空 chunkData
     agentStore.updateFileTransfer(fileId, {
       status: 'completed',
-      completedAt: Date.now()
+      completedAt: Date.now(),
+      chunkData: null
     });
 
     // 通知发送方
@@ -341,12 +336,9 @@ class FileHandler {
       return { valid: false, error: `Unsupported file type: ${ext}` };
     }
 
-    // 检查 MIME 类型
-    if (mimeType && !ALLOWED_MIME_TYPES.includes(mimeType)) {
-      // 对于 application/octet-stream，需要额外检查扩展名
-      if (mimeType !== 'application/octet-stream') {
-        return { valid: false, error: `Unsupported MIME type: ${mimeType}` };
-      }
+    // 检查 MIME 类型（仅当提供且非 octet-stream 时检查）
+    if (mimeType && mimeType !== 'application/octet-stream' && !ALLOWED_MIME_TYPES.includes(mimeType)) {
+      return { valid: false, error: `Unsupported MIME type: ${mimeType}` };
     }
 
     return { valid: true };
@@ -359,14 +351,17 @@ class FileHandler {
    */
   getFileExtension(filename) {
     const lower = filename.toLowerCase();
-    if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) {
+    if (lower.endsWith('.tar.gz')) {
       return '.tar.gz';
     }
     if (lower.endsWith('.tar.bz2')) {
       return '.tar.bz2';
     }
+    if (lower.endsWith('.tgz')) {
+      return '.tgz';
+    }
     const idx = filename.lastIndexOf('.');
-    return idx > 0 ? filename.slice(idx) : '';
+    return idx > 0 ? filename.slice(idx).toLowerCase() : '';
   }
 
   /**

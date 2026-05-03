@@ -49,8 +49,9 @@ router.get('/agents/:id/messages', (req, res) => {
   try {
     const { id } = req.params;
     const limit = parseInt(req.query.limit) || 100;
+    const safeLimit = (!Number.isNaN(limit) && limit > 0) ? limit : 100;
 
-    const messages = agentStore.getMessages({ agentId: id, limit });
+    const messages = agentStore.getMessages({ agentId: id, limit: safeLimit });
     res.json({
       success: true,
       agentId: id,
@@ -95,7 +96,7 @@ router.get('/agents/:id/status', (req, res) => {
 /**
  * POST /api/agents/:id/message - 发送消息给 Agent
  */
-router.post('/agents/:id/message', express.json(), (req, res) => {
+router.post('/agents/:id/message', (req, res) => {
   try {
     const { id } = req.params;
     const { content, type = 'text', from = 'server', metadata = {} } = req.body;
@@ -146,9 +147,10 @@ router.post('/agents/:id/message', express.json(), (req, res) => {
 router.get('/messages', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
+    const safeLimit = (!Number.isNaN(limit) && limit > 0) ? limit : 100;
     const type = req.query.type || null;
 
-    const messages = agentStore.getMessages({ limit, type });
+    const messages = agentStore.getMessages({ limit: safeLimit, type });
     res.json({
       success: true,
       count: messages.length,

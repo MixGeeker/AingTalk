@@ -30,6 +30,12 @@ class SystemInfoCollector {
     const platform = os.platform();
     const arch = os.arch();
 
+    // 并行执行独立的异步子采集
+    const [capabilities, claudeCode] = await Promise.all([
+      this.getCapabilities(),
+      this.getClaudeCodeInfo()
+    ]);
+
     return {
       hostname: os.hostname(),
       platform,
@@ -45,8 +51,8 @@ class SystemInfoCollector {
       },
       network: this.#getNetworkInfo(),
       workDir: process.cwd(),
-      capabilities: await this.getCapabilities(),
-      claudeCode: await this.getClaudeCodeInfo()
+      capabilities,
+      claudeCode
     };
   }
 
@@ -63,7 +69,7 @@ class SystemInfoCollector {
     return {
       timestamp: Date.now(),
       cpuUsage: Math.round(cpuUsage * 100) / 100,
-      memoryUsage: Math.round(memoryUsage.used / 1024 / 1024 * 100) / 100, // MB
+      memoryUsageMB: Math.round(memoryUsage.used / 1024 / 1024 * 100) / 100, // MB
       memoryPercent: Math.round(memoryUsage.percent * 100) / 100,
       diskUsage: diskUsage.percent,
       diskFree: diskUsage.free,
@@ -155,12 +161,13 @@ class SystemInfoCollector {
       info.available = true;
       info.path = claudePath;
 
-      // 获取版本
+      // 获取版本（不使用引号包裹路径，避免 Windows 下 spawn 模式歧义）
       try {
-        const versionOutput = execSync(`"${claudePath}" --version`, {
+        const versionOutput = execSync(`${claudePath} --version`, {
           encoding: 'utf8',
           timeout: 10000,
-          windowsHide: true
+          windowsHide: true,
+          shell: true
         }).trim();
         info.version = versionOutput;
       } catch (versionErr) {
@@ -196,12 +203,13 @@ class SystemInfoCollector {
       { name: 'rustc', cmd: 'rustc' }
     ];
 
-    for (const tool of tools) {
-      try {
-        await commandExists(tool.cmd);
-        capabilities.push(tool.name);
-      } catch (e) {
-        // 命令不存在，跳过
+    // 并行检测所有工具
+    const results = await Promise.allSettled(
+      tools.map(tool => commandExists(tool.cmd).then(() => tool.name).catch(() => null))
+    );
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) {
+        capabilities.push(result.value);
       }
     }
 
@@ -361,7 +369,7 @@ class SystemInfoCollector {
         }
       }
     } catch (e) {
-      // 回退到手动计算
+      console.warn(`[SystemInfo] node-disk-info 获取磁盘信息失败: ${e.message}，回退到系统命令`);
     }
 
     // 回退方案：使用 workDir 所在路径的磁盘信息
@@ -388,20 +396,21 @@ class SystemInfoCollector {
         });
         const lines = output.split('\n');
         let deviceId = '', size = 0, freeSpace = 0;
+        // 优先选择 C: 盘，没有则选第一个有数据的盘
+        let best = null;
         for (const line of lines) {
           if (line.startsWith('DeviceID=')) deviceId = line.split('=')[1]?.trim();
           if (line.startsWith('Size=')) size = parseInt(line.split('=')[1]?.trim(), 10) || 0;
           if (line.startsWith('FreeSpace=')) freeSpace = parseInt(line.split('=')[1]?.trim(), 10) || 0;
           if (deviceId && size && freeSpace) {
-            const used = size - freeSpace;
-            return {
-              total: size,
-              free: freeSpace,
-              used,
-              percent: (used / size) * 100
-            };
+            const disk = { total: size, free: freeSpace, used: size - freeSpace, percent: ((size - freeSpace) / size) * 100 };
+            if (deviceId === 'C:') {
+              return disk;
+            }
+            if (!best) best = disk;
           }
         }
+        if (best) return best;
       } else {
         const output = execSync('df -k "$(pwd)" | tail -1', {
           encoding: 'utf8',

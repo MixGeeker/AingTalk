@@ -25,6 +25,8 @@ class SocketClient {
     this.messageCallback = null;
     this.claudeExecuteCallback = null;
     this.fileRequestCallback = null;
+    this.fileChunkCallback = null;
+    this.fileCompleteCallback = null;
     this.roleAssignCallback = null;
     this.taskAssignCallback = null;
     this.statusQueryCallback = null;
@@ -47,10 +49,14 @@ class SocketClient {
     const url = serverUrl || this.serverUrl;
 
     return new Promise((resolve, reject) => {
-      if (this.socket && this.connected) {
-        resolve(true);
-        return;
+      // 清理旧连接
+      if (this.socket) {
+        this.socket.removeAllListeners();
+        this.socket.disconnect();
+        this.socket = null;
       }
+
+      this.connected = false;
 
       try {
         this.socket = io(url, {
@@ -77,8 +83,19 @@ class SocketClient {
   #setupEventHandlers(connectResolve, connectReject) {
     let connectResolved = false;
 
+    let connTimeout = null;
+
+    // 连接超时保护
+    connTimeout = setTimeout(() => {
+      if (!connectResolved) {
+        connectResolved = true;
+        connectReject(new Error('Connection timeout (30s)'));
+      }
+    }, 30000);
+
     // 连接成功
     this.socket.on('connect', () => {
+      clearTimeout(connTimeout);
       this.connected = true;
       this.reconnectAttempts = 0;
       console.log(`[SocketClient] 已连接到 Server: ${this.serverUrl}`);
@@ -525,9 +542,9 @@ class SocketClient {
       this.reconnectTimer = null;
     }
 
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
     if (this.socket) {

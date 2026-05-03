@@ -48,7 +48,11 @@ class AgentStore {
   updateAgent(agentId, updates) {
     const agent = this.agents.get(agentId);
     if (!agent) return false;
-    Object.assign(agent, updates);
+    for (const [key, value] of Object.entries(updates)) {
+      if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype') {
+        agent[key] = value;
+      }
+    }
     return true;
   }
 
@@ -58,9 +62,13 @@ class AgentStore {
     this.messages.push(message);
     this.stats.totalMessages++;
 
-    // 保留最近 1000 条
+    // 保留最近 1000 条，同步清理对应的送达确认记录
     if (this.messages.length > this.maxMessages) {
+      const removed = this.messages.slice(0, this.messages.length - this.maxMessages);
       this.messages = this.messages.slice(-this.maxMessages);
+      for (const msg of removed) {
+        this.deliveryConfirms.delete(msg.id);
+      }
     }
 
     return message;
@@ -98,10 +106,9 @@ class AgentStore {
     }
     this.deliveryConfirms.get(messageId).add(agentId);
 
-    // 更新消息送达状态
     const message = this.getMessageById(messageId);
     if (message) {
-      message.delivered = true;
+      message.deliveredTo = [...(this.deliveryConfirms.get(messageId) || [])];
       message.deliveredAt = Date.now();
     }
   }
@@ -129,8 +136,36 @@ class AgentStore {
   updateFileTransfer(fileId, updates) {
     const transfer = this.fileTransfers.get(fileId);
     if (!transfer) return false;
-    Object.assign(transfer, updates);
+    for (const [key, value] of Object.entries(updates)) {
+      if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype') {
+        transfer[key] = value;
+      }
+    }
+
+    // 终端状态 1 小时后自动清理
+    if (updates.status === 'completed' || updates.status === 'failed' || updates.status === 'rejected') {
+      const now = Date.now();
+      setTimeout(() => {
+        const t = this.fileTransfers.get(fileId);
+        if (t && (t.status === 'completed' || t.status === 'failed' || t.status === 'rejected')) {
+          this.fileTransfers.delete(fileId);
+        }
+      }, 3600000);
+    }
+
     return true;
+  }
+
+  cleanupStaleTransfers(maxAge = 3600000) {
+    const now = Date.now();
+    for (const [id, transfer] of this.fileTransfers.entries()) {
+      if (
+        (transfer.status === 'completed' || transfer.status === 'failed' || transfer.status === 'rejected') &&
+        now - (transfer.completedAt || transfer.createdAt) > maxAge
+      ) {
+        this.fileTransfers.delete(id);
+      }
+    }
   }
 
   // ========== 统计信息 ==========

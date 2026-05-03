@@ -250,7 +250,7 @@ let heartbeatInterval = null
 onMounted(() => {
   heartbeatInterval = setInterval(() => {
     heartbeatHistory.value.shift()
-    heartbeatHistory.value.push(store.latency || Math.floor(Math.random() * 50))
+    heartbeatHistory.value.push(store.latency ?? 0)
   }, 2000)
 })
 

@@ -148,15 +148,47 @@ process.on('SIGINT', () => {
   });
 });
 
-// 未捕获的异常处理
+// 未捕获的异常处理 — 记录后优雅关闭，让进程管理器重启
 process.on('uncaughtException', (err) => {
-  console.error('[Server] Uncaught exception:', err);
-  // 不退出，保持服务运行
+  console.error('[Server] Uncaught exception, shutting down:', err);
+  gracefulShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Server] Unhandled rejection at:', promise, 'reason:', reason);
-  // 不退出，保持服务运行
+  console.error('[Server] Unhandled rejection, shutting down:', reason);
+  gracefulShutdown('unhandledRejection');
 });
+
+function gracefulShutdown(signal) {
+  console.log(`[Server] Graceful shutdown initiated (${signal})`);
+  socketHandler.heartbeatMonitor.stopMonitoring();
+
+  // 强制保护：5 秒后仍未退出则强制终止
+  const forceExit = setTimeout(() => {
+    console.error('[Server] Forced shutdown after 5s grace period');
+    process.exit(1);
+  }, 5000);
+  forceExit.unref();
+
+  io.close(() => {
+    httpServer.close(() => {
+      clearTimeout(forceExit);
+      console.log('[Server] Server closed');
+      process.exit(1);
+    });
+  });
+}
+
+// ========== 周期性清理 ==========
+
+// 每小时清理完成的文件传输记录
+setInterval(() => {
+  try {
+    const { agentStore } = require('./services/agent-store');
+    agentStore.cleanupStaleTransfers();
+  } catch (e) {
+    // ignore cleanup errors
+  }
+}, 3600000).unref();
 
 module.exports = { app, io, httpServer };

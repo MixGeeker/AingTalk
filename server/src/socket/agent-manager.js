@@ -25,12 +25,12 @@ class AgentManager {
       // 检查是否已存在同 ID 的 Agent
       const existingAgent = agentStore.getAgent(agentInfo.id);
       if (existingAgent) {
-        // 更新 socketId 和状态
+        // 更新：先展开 agentInfo，再覆盖服务端必须控制的字段
         agentStore.updateAgent(agentInfo.id, {
+          ...agentInfo,
           socketId: socket.id,
           status: 'online',
-          lastHeartbeat: Date.now(),
-          ...agentInfo
+          lastHeartbeat: Date.now()
         });
       } else {
         // 创建新 Agent
@@ -52,7 +52,10 @@ class AgentManager {
           lastHeartbeat: Date.now(),
           heartbeatLatency: 0,
           connectedAt: Date.now(),
-          startedAt: agentInfo.startedAt ? new Date(agentInfo.startedAt).getTime() : Date.now()
+          startedAt: (() => {
+            const ts = agentInfo.startedAt ? new Date(agentInfo.startedAt).getTime() : 0;
+            return Number.isNaN(ts) ? Date.now() : ts;
+          })()
         };
 
         agentStore.addAgent(agent);
@@ -90,7 +93,12 @@ class AgentManager {
    * @returns {Agent[]}
    */
   getAgents() {
-    return agentStore.getAllAgents();
+    return agentStore.getAllAgents().map(a => this.sanitizeAgent(a));
+  }
+
+  sanitizeAgent(agent) {
+    const { socketId, ip, ...safe } = agent;
+    return safe;
   }
 
   /**

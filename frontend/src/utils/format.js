@@ -25,7 +25,7 @@ export function formatDateTime(timestamp) {
 export function formatFileSize(bytes) {
   if (bytes === 0 || bytes == null) return '0 B'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
@@ -77,14 +77,26 @@ export function getPlatformName(platform) {
  */
 export function getStatusColor(status) {
   const colors = {
-    online: 'text-green-400 bg-green-400',
-    idle: 'text-green-400 bg-green-400',
-    busy: 'text-yellow-400 bg-yellow-400',
-    error: 'text-red-400 bg-red-400',
-    offline: 'text-gray-500 bg-gray-500',
-    disconnected: 'text-gray-500 bg-gray-500'
+    online: 'text-green-400',
+    idle: 'text-green-400',
+    busy: 'text-yellow-400',
+    error: 'text-red-400',
+    offline: 'text-gray-500',
+    disconnected: 'text-gray-500'
   }
   return colors[status] || colors.offline
+}
+
+export function getStatusDotClass(status) {
+  const map = {
+    online: 'bg-green-400',
+    idle: 'bg-green-400',
+    busy: 'bg-yellow-400',
+    error: 'bg-red-400',
+    offline: 'bg-gray-600',
+    disconnected: 'bg-gray-600'
+  }
+  return map[status] || 'bg-gray-600'
 }
 
 /**

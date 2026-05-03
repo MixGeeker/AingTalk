@@ -64,7 +64,7 @@ class HeartbeatMonitor {
     }
 
     const now = Date.now();
-    const latency = now - (heartbeat.timestamp || now);
+    const latency = now - (heartbeat.timestamp ?? now);
 
     // 更新心跳记录
     this.heartbeatRecords.set(agentId, {
@@ -99,10 +99,9 @@ class HeartbeatMonitor {
 
     agentStore.updateAgent(agentId, updates);
 
-    // 发送心跳确认
-    const agentSocket = this.io.sockets.sockets.get(agent.socketId);
-    if (agentSocket) {
-      agentSocket.emit('heartbeat:ack', { serverTime: now });
+    // 发送心跳确认（使用 io.to 而非内部 API）
+    if (agent.socketId) {
+      this.io.to(agent.socketId).emit('heartbeat:ack', { serverTime: now });
     }
 
     // 向前端广播心跳更新
@@ -151,8 +150,24 @@ class HeartbeatMonitor {
       }
     }
 
-    // 同时检查 agents 存储中还没有心跳记录的 Agent
-    //（新注册但从未发送过心跳的 Agent 不需要检查）
+    // 同时检查 agentStore 中状态为 online 但从未发送过心跳的 Agent
+    // 如果注册 2 分钟仍无首次心跳，标记为 offline
+    const allOnlineAgents = agentStore.getAllAgents().filter(a => a.status === 'online');
+    for (const agent of allOnlineAgents) {
+      if (!this.heartbeatRecords.has(agent.id)) {
+        const timeSinceRegistration = now - agent.connectedAt;
+        if (timeSinceRegistration > 120000) {
+          console.warn(`[Heartbeat] Agent never sent heartbeat: ${agent.id} (registered ${timeSinceRegistration}ms ago)`);
+          this.agentManager.updateAgentStatus(agent.id, 'offline');
+          this.io.emit('agent:status-update', {
+            agentId: agent.id,
+            status: 'offline',
+            reason: 'no_heartbeat',
+            timestamp: now
+          });
+        }
+      }
+    }
 
     return timedOutAgents;
   }
