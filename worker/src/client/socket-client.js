@@ -38,6 +38,11 @@ class SocketClient {
 
     // 用于流式输出控制
     this.activeClaudeTask = null;
+
+    // Agent 列表缓存和待处理请求
+    this._agentCache = null;
+    this._pendingRequests = new Map();
+    this.agentListCallback = null;
   }
 
   /**
@@ -223,6 +228,14 @@ class SocketClient {
       }
     });
 
+    // Agent 列表事件
+    this.socket.on('agent:list', (agents) => {
+      this._agentCache = agents;
+      if (this.agentListCallback) {
+        this.agentListCallback(agents);
+      }
+    });
+
     // Agent 连接/断开通知
     this.socket.on('agent:connected', (data) => {
       console.log(`[SocketClient] Agent 上线: ${data.name} (${data.agentId})`);
@@ -230,6 +243,23 @@ class SocketClient {
 
     this.socket.on('agent:disconnected', (data) => {
       console.log(`[SocketClient] Agent 离线: ${data.name || data.agentId} (${data.agentId})`);
+    });
+
+    // Claude Code 执行响应（从目标 Agent 返回给请求方）
+    this.socket.on('claude:execute:result', (data) => {
+      const resolver = this._pendingRequests?.get(data.requestId);
+      if (resolver) {
+        this._pendingRequests.delete(data.requestId);
+        resolver(data);
+      }
+    });
+
+    this.socket.on('claude:execute:error', (data) => {
+      const resolver = this._pendingRequests?.get(data.requestId);
+      if (resolver) {
+        this._pendingRequests.delete(data.requestId);
+        resolver({ error: data.error, taskId: data.taskId });
+      }
     });
 
     // 错误
@@ -445,7 +475,7 @@ class SocketClient {
    * @param {number} duration - 执行时长(ms)
    * @param {string} summary - 摘要
    */
-  sendClaudeComplete(taskId, exitCode, duration, summary = '') {
+  sendClaudeComplete(taskId, exitCode, duration, summary = '', requestId = null) {
     if (!this.socket || !this.connected) {
       return false;
     }
@@ -454,7 +484,8 @@ class SocketClient {
       taskId,
       exitCode,
       duration,
-      summary
+      summary,
+      requestId
     });
     this.activeClaudeTask = null;
     return true;
@@ -531,6 +562,82 @@ class SocketClient {
 
   onHeartbeatAck(callback) {
     this.heartbeatAckCallback = callback;
+  }
+
+  onAgentList(callback) {
+    this.agentListCallback = callback;
+  }
+
+  // ==================== 请求/响应模式方法 ====================
+
+  /**
+   * 请求 Agent 列表
+   * @returns {Promise<Array>}
+   */
+  requestAgentList() {
+    return new Promise((resolve, reject) => {
+      if (!this.socket || !this.connected) {
+        reject(new Error('Socket 未连接'));
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        reject(new Error('Request agent list timeout'));
+      }, 10000);
+
+      const handler = (agents) => {
+        clearTimeout(timeout);
+        this.socket.off('agent:list', handler);
+        resolve(agents);
+      };
+
+      this.socket.on('agent:list', handler);
+      this.socket.emit('agent:list:request');
+    });
+  }
+
+  /**
+   * 请求目标 Agent 执行 Claude Code
+   * @param {Object} params
+   * @param {string} params.targetAgentId - 目标 Agent ID
+   * @param {string} params.taskId - 任务 ID
+   * @param {string} params.prompt - Claude Code prompt
+   * @param {Object} [params.context] - 上下文
+   * @param {number} [params.timeout] - 超时时间
+   * @returns {Promise<Object>} 执行结果
+   */
+  sendClaudeExecuteRequest({ targetAgentId, taskId, prompt, context = {}, timeout = 300000 }) {
+    return new Promise((resolve, reject) => {
+      if (!this.socket || !this.connected) {
+        reject(new Error('Socket 未连接'));
+        return;
+      }
+
+      const requestId = uuidv4();
+      const timer = setTimeout(() => {
+        this._pendingRequests.delete(requestId);
+        reject(new Error(`Claude execute request timeout for agent ${targetAgentId}`));
+      }, timeout + 30000); // 比任务超时多 30 秒
+
+      this._pendingRequests.set(requestId, (result) => {
+        clearTimeout(timer);
+        if (result.error) {
+          reject(new Error(result.error));
+        } else {
+          resolve(result);
+        }
+      });
+
+      this.socket.emit('claude:execute:request', {
+        requestId,
+        targetAgentId,
+        taskId,
+        prompt,
+        context,
+        timeout,
+        fromAgentId: this.agentId
+      });
+    });
   }
 
   /**

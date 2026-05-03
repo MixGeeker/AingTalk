@@ -15,5 +15,8 @@
     "build:frontend": "pnpm -F agent-collab-frontend build",
     "docker:build": "docker compose build",
     "docker:up": "docker compose up -d"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.7.4"
   }
 }

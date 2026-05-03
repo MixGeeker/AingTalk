@@ -141,6 +141,9 @@ class Worker {
     console.log(`  Name: ${this.config.name}`);
     console.log(`  WorkDir: ${this.config.workDir}`);
 
+    // 2.5 初始化 Claude Code 运行环境（确保 bypassPermissions）
+    this.#setupClaudeCodeEnvironment();
+
     // 3. 初始化各模块
     this.systemCollector = new SystemInfoCollector({
       claudeCodePath: this.config.claudeCodePath
@@ -237,6 +240,42 @@ class Worker {
       } else {
         process.exit(1);
       }
+    }
+  }
+
+  /**
+   * 初始化 Claude Code 运行环境
+   * 在 workDir 下写入 .claude/settings.local.json，确保 Claude Code 以 bypassPermissions 模式运行
+   * @private
+   */
+  #setupClaudeCodeEnvironment() {
+    const claudeDir = path.join(this.config.workDir, '.claude');
+    const settingsPath = path.join(claudeDir, 'settings.local.json');
+
+    try {
+      if (!require('fs').existsSync(claudeDir)) {
+        require('fs').mkdirSync(claudeDir, { recursive: true });
+        console.log(`[Worker] 创建 .claude 目录: ${claudeDir}`);
+      }
+
+      const settings = {
+        permissions: {
+          allow: [
+            'Bash(*)',
+            'Read(*)',
+            'Write(*)',
+            'Edit(*)',
+            'WebFetch(*)',
+            'WebSearch(*)'
+          ],
+          defaultMode: 'bypassPermissions'
+        }
+      };
+
+      require('fs').writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      console.log(`[Worker] Claude Code 环境已配置 (bypassPermissions): ${settingsPath}`);
+    } catch (err) {
+      console.error(`[Worker] 配置 Claude Code 环境失败: ${err.message}`);
     }
   }
 
@@ -385,20 +424,20 @@ class Worker {
       return;
     }
 
-    const { taskId, prompt, context, timeout } = data;
+    const { taskId, prompt, context, timeout, requestId, fromAgentId } = data;
 
     // 防止并发执行
     if (this.status === 'busy') {
       console.warn(`[Worker] Already busy, rejecting task ${taskId}`);
       this.socketClient.sendClaudeOutput(taskId, '错误: Agent 正忙，请稍后再试\n', 'error');
-      this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Agent busy');
+      this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Agent busy', requestId);
       return;
     }
 
     // 检查 Claude Code 是否可用
     if (!(await this.claudeExecutor.isAvailable())) {
       this.socketClient.sendClaudeOutput(taskId, '错误: Claude Code 不可用\n', 'stderr');
-      this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Claude Code 不可用');
+      this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Claude Code 不可用', requestId);
       return;
     }
 
@@ -442,7 +481,8 @@ class Worker {
             taskId,
             hasError ? 1 : 0,
             duration,
-            summary
+            summary,
+            requestId
           );
         }
       }
@@ -453,7 +493,7 @@ class Worker {
       console.error(`[Worker] Claude Code 执行失败:`, error.message);
 
       this.socketClient.sendClaudeOutput(taskId, `执行错误: ${error.message}\n`, 'error');
-      this.socketClient.sendClaudeComplete(taskId, -1, duration, error.message);
+      this.socketClient.sendClaudeComplete(taskId, -1, duration, error.message, requestId);
     } finally {
       this.status = 'idle';
       this.currentTask = null;

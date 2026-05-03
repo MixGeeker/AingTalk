@@ -122,6 +122,17 @@ class SocketHandler {
       }
       console.log(`[Socket] Claude complete for task ${data?.taskId}, exitCode: ${data?.exitCode}`);
       this.io.emit('claude:complete', data);
+
+      // 如果有请求方（MCP Agent 发起的），回传结果
+      if (data.requestId) {
+        this.io.emit('claude:execute:result', {
+          requestId: data.requestId,
+          taskId: data.taskId,
+          exitCode: data.exitCode,
+          duration: data.duration,
+          summary: data.summary
+        });
+      }
     });
 
     // ========== Agent 状态报告 ==========
@@ -155,6 +166,44 @@ class SocketHandler {
     });
 
     // ========== 前端事件 ==========
+
+    // === Agent 列表请求 (MCP/Worker 按需获取) ===
+    socket.on('agent:list:request', () => {
+      socket.emit('agent:list', this.agentManager.getAgents());
+    });
+
+    // === Claude Code 执行请求 (Agent A 请求让 Agent B 执行 Claude Code) ===
+    socket.on('claude:execute:request', (data) => {
+      if (!data || !data.targetAgentId || !data.taskId) {
+        socket.emit('claude:execute:error', {
+          requestId: data?.requestId,
+          error: 'Invalid claude:execute:request payload'
+        });
+        return;
+      }
+
+      const targetAgent = this.agentManager.getAgent(data.targetAgentId);
+      if (!targetAgent || !targetAgent.socketId) {
+        socket.emit('claude:execute:error', {
+          requestId: data.requestId,
+          taskId: data.taskId,
+          error: `Agent ${data.targetAgentId} not found or offline`
+        });
+        return;
+      }
+
+      console.log(`[Socket] Claude execute request: ${data.taskId} -> ${data.targetAgentId}`);
+
+      // 向目标 Worker 发送 claude:execute
+      this.io.to(targetAgent.socketId).emit('claude:execute', {
+        taskId: data.taskId,
+        prompt: data.prompt,
+        context: data.context || {},
+        timeout: data.timeout || 300000,
+        requestId: data.requestId,
+        fromAgentId: data.fromAgentId
+      });
+    });
 
     // 前端加入监控面板
     socket.on('dashboard:join', () => {

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "aingtalk": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["worker/src/mcp-server.mjs"],
+      "env": {
+        "AINGTALK_SERVER_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
