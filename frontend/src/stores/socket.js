@@ -6,46 +6,27 @@ export const useSocketStore = defineStore('socket', () => {
   // ========== State ==========
   const socket = ref(null)
   const agents = ref([])
-  const messages = ref([])
-  const transfers = ref([])
   const systemStats = ref({
     totalAgents: 0,
     onlineAgents: 0,
-    totalMessages: 0,
-    avgLatency: 0,
     uptime: 0
   })
   const connected = ref(false)
-  const currentAgentId = ref(null)
   const latency = ref(0)
   const connectionError = ref(null)
   const claudeTasks = ref({})
+
+  // Agent terminal sessions: agentId -> { taskId, status, startedAt }
+  const agentSessions = ref({})
 
   // Claude output callbacks (component-level, not reactive)
   let _claudeOutputCallbacks = []
   let _claudeCompleteCallbacks = []
 
   // ========== Getters ==========
-  const onlineAgents = computed(() => agents.value.filter(a => a.status === 'online' || a.status === 'idle'))
-  const busyAgents = computed(() => agents.value.filter(a => a.status === 'busy'))
-  const offlineAgents = computed(() => agents.value.filter(a => a.status === 'offline' || a.status === 'disconnected' || a.status === 'error'))
-  const selectedAgent = computed(() => agents.value.find(a => a.id === currentAgentId.value) || null)
-
-  const currentMessages = computed(() => {
-    if (!currentAgentId.value) return []
-    return messages.value.filter(m =>
-      m.from === currentAgentId.value ||
-      m.to === currentAgentId.value ||
-      m.to === 'broadcast'
-    ).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
-  })
-
-  const currentTransfers = computed(() => {
-    if (!currentAgentId.value) return []
-    return transfers.value.filter(t =>
-      t.from === currentAgentId.value || t.to === currentAgentId.value
-    )
-  })
+  const onlineAgents = computed(() => agents.value.filter(a =>
+    a.status === 'online' || a.status === 'idle' || a.status === 'busy'
+  ))
 
   // ========== Actions ==========
 
@@ -107,7 +88,6 @@ export const useSocketStore = defineStore('socket', () => {
         })
       }
       updateStats()
-      addSystemMessage(`Agent "${data.name}" 上线`, 'success')
     })
 
     // Agent disconnected
@@ -121,7 +101,6 @@ export const useSocketStore = defineStore('socket', () => {
         }
       }
       updateStats()
-      addSystemMessage(`Agent "${data.name}" 离线`, 'warning')
     })
 
     // Agent updated
@@ -131,28 +110,6 @@ export const useSocketStore = defineStore('socket', () => {
         agents.value[idx] = { ...agents.value[idx], ...data }
       }
       updateStats()
-    })
-
-    // New message - merge server version over optimistic local
-    socket.value.on('message:new', (data) => {
-      const message = data.message || data
-      if (!message || !message.id) return
-      const idx = messages.value.findIndex(m => m.id === message.id)
-      if (idx >= 0) {
-        messages.value[idx] = { ...messages.value[idx], ...message }
-      } else {
-        messages.value.push(message)
-        systemStats.value.totalMessages++
-      }
-    })
-
-    // Message delivered confirmation
-    socket.value.on('message:delivered', (data) => {
-      const msg = messages.value.find(m => m.id === data.messageId)
-      if (msg) {
-        msg.delivered = true
-        msg.deliveredAt = data.timestamp
-      }
     })
 
     // Heartbeat update
@@ -175,50 +132,55 @@ export const useSocketStore = defineStore('socket', () => {
       }
     })
 
-    // Transfer update
-    socket.value.on('transfer:update', (data) => {
-      const idx = transfers.value.findIndex(t => t.id === data.id)
-      if (idx >= 0) {
-        transfers.value[idx] = { ...transfers.value[idx], ...data }
-      } else {
-        transfers.value.push(data)
-      }
-    })
-
-    // Transfer progress
-    socket.value.on('transfer:progress', (data) => {
-      const idx = transfers.value.findIndex(t => t.id === data.fileId)
-      if (idx >= 0) {
-        transfers.value[idx].progress = data.progress
-        transfers.value[idx].status = data.status
-      }
-    })
-
     // System stats
     socket.value.on('system:stats', (data) => {
       systemStats.value = { ...systemStats.value, ...data }
     })
 
-    // Heartbeat ack (RTT latency calculation using echoed client time)
+    // Agent status update
+    socket.value.on('agent:status-update', (data) => {
+      const idx = agents.value.findIndex(a => a.id === data.agentId)
+      if (idx >= 0) {
+        agents.value[idx] = {
+          ...agents.value[idx],
+          status: data.status,
+          lastSeen: data.timestamp || Date.now()
+        }
+        updateStats()
+      }
+    })
+
+    // Heartbeat ack
     socket.value.on('heartbeat:ack', (data) => {
       if (data.clientTime) {
         latency.value = Date.now() - data.clientTime
       }
     })
 
-    // Claude Code streaming output
+    // Claude Code streaming output — route by agentId
     socket.value.on('claude:output', (data) => {
       if (data?.taskId) {
         if (!claudeTasks.value[data.taskId]) {
           claudeTasks.value[data.taskId] = {
             status: 'running',
-            startedAt: Date.now()
+            startedAt: Date.now(),
+            agentId: data.agentId || null
           }
         }
         claudeTasks.value[data.taskId].lastChunkAt = Date.now()
       }
+
+      // Track agent session
+      if (data?.agentId) {
+        if (!agentSessions.value[data.agentId]) {
+          agentSessions.value[data.agentId] = { taskId: null, status: 'idle', startedAt: null }
+        }
+        agentSessions.value[data.agentId].status = 'running'
+        agentSessions.value[data.agentId].taskId = data.taskId
+      }
+
       _claudeOutputCallbacks.forEach(cb => {
-        try { cb(data) } catch (e) { /* don't break sibling callbacks */ }
+        try { cb(data) } catch (e) {}
       })
     })
 
@@ -228,6 +190,14 @@ export const useSocketStore = defineStore('socket', () => {
         claudeTasks.value[data.taskId].duration = data.duration
         claudeTasks.value[data.taskId].exitCode = data.exitCode
       }
+
+      // Update agent session
+      if (data?.agentId && agentSessions.value[data.agentId]) {
+        agentSessions.value[data.agentId].status = 'idle'
+        agentSessions.value[data.agentId].lastExitCode = data.exitCode
+        agentSessions.value[data.agentId].lastDuration = data.duration
+      }
+
       _claudeCompleteCallbacks.forEach(cb => {
         try { cb(data) } catch (e) {}
       })
@@ -242,74 +212,7 @@ export const useSocketStore = defineStore('socket', () => {
     }
     connected.value = false
     agents.value = []
-    messages.value = []
-    transfers.value = []
-  }
-
-  function sendMessage(message) {
-    if (!socket.value?.connected) {
-      console.error('[Socket] Not connected, cannot send message')
-      return false
-    }
-    const payload = {
-      id: generateId(),
-      timestamp: Date.now(),
-      ...message
-    }
-    socket.value.emit('message', payload)
-
-    // Optimistically add to local messages
-    if (!messages.value.find(m => m.id === payload.id)) {
-      messages.value.push(payload)
-      systemStats.value.totalMessages++
-    }
-    return true
-  }
-
-  function sendBtwMessage(target, content, options = {}) {
-    return sendMessage({
-      to: target,
-      type: 'btw',
-      content,
-      metadata: {
-        isBtw: true,
-        urgency: options.urgency || 'normal',
-        replyTo: options.replyTo || null
-      }
-    })
-  }
-
-  function assignRole(agentId, role, description) {
-    if (!socket.value?.connected) return false
-
-    sendMessage({
-      to: agentId,
-      type: 'role-assign',
-      content: `你被分配为 "${role}" 角色`,
-      metadata: {
-        roleName: role,
-        roleDescription: description
-      }
-    })
-
-    // Update local agent
-    const idx = agents.value.findIndex(a => a.id === agentId)
-    if (idx >= 0) {
-      agents.value[idx].role = role
-    }
-    return true
-  }
-
-  function requestStatus(agentId) {
-    if (!socket.value?.connected) return false
-
-    sendMessage({
-      to: agentId,
-      type: 'status-query',
-      content: '请报告你当前的工作状态',
-      metadata: { queryType: 'full-status' }
-    })
-    return true
+    agentSessions.value = {}
   }
 
   function joinDashboard() {
@@ -317,30 +220,9 @@ export const useSocketStore = defineStore('socket', () => {
     socket.value.emit('dashboard:join', { timestamp: Date.now() })
   }
 
-  function selectAgent(agentId) {
-    currentAgentId.value = agentId
-  }
-
-  function sendFile(fileRequest) {
+  function cancelClaudeTask(taskId, agentId) {
     if (!socket.value?.connected) return false
-    socket.value.emit('file:request', fileRequest)
-
-    transfers.value.push({
-      id: fileRequest.id,
-      name: fileRequest.name,
-      size: fileRequest.size,
-      from: 'dashboard',
-      to: fileRequest.to,
-      status: 'pending',
-      progress: 0,
-      timestamp: Date.now()
-    })
-    return true
-  }
-
-  function respondToFile(fileId, accepted) {
-    if (!socket.value?.connected) return false
-    socket.value.emit('file:response', { fileId, accepted })
+    socket.value.emit('claude:cancel', { taskId, targetAgentId: agentId })
     return true
   }
 
@@ -365,52 +247,23 @@ export const useSocketStore = defineStore('socket', () => {
     systemStats.value.onlineAgents = onlineAgents.value.length
   }
 
-  function addSystemMessage(text, type = 'info') {
-    messages.value.push({
-      id: 'sys-' + Date.now(),
-      from: 'system',
-      to: 'broadcast',
-      type: 'system',
-      content: text,
-      metadata: { systemType: type },
-      timestamp: Date.now()
-    })
-  }
-
-  function generateId() {
-    return 'msg-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9)
-  }
-
   return {
     // State
     socket,
     agents,
-    messages,
-    transfers,
     systemStats,
     connected,
-    currentAgentId,
     latency,
     connectionError,
+    claudeTasks,
+    agentSessions,
     // Getters
     onlineAgents,
-    busyAgents,
-    offlineAgents,
-    selectedAgent,
-    currentMessages,
-    currentTransfers,
     // Actions
     connect,
     disconnect,
-    sendMessage,
-    sendBtwMessage,
-    assignRole,
-    requestStatus,
     joinDashboard,
-    selectAgent,
-    sendFile,
-    respondToFile,
-    claudeTasks,
+    cancelClaudeTask,
     onClaudeOutput,
     onClaudeComplete
   }

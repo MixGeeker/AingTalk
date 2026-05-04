@@ -118,6 +118,7 @@ class Worker {
     this.recentLogs = [];
     this.role = '';
     this.connected = false;
+    this.taskSessions = new Map(); // taskId → sessionId
   }
 
   /**
@@ -424,7 +425,7 @@ class Worker {
       return;
     }
 
-    const { taskId, prompt, context, timeout, requestId, fromAgentId } = data;
+    const { taskId, prompt, context, timeout, requestId, fromAgentId, sessionId, resume } = data;
 
     // 防止并发执行
     if (this.status === 'busy') {
@@ -441,10 +442,16 @@ class Worker {
       return;
     }
 
+    // 确定会话 ID：必须是有效 UUID，否则生成新的
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const effectiveSessionId = (resume && sessionId && UUID_RE.test(sessionId))
+      ? sessionId
+      : uuidv4();
+
     // 设置状态
     this.status = 'busy';
     this.currentTask = { id: taskId, description: prompt.substring(0, 100) };
-    this.log(`开始执行 Claude Code 任务: ${taskId}`);
+    this.log(`开始执行 Claude Code 任务: ${taskId} (session: ${effectiveSessionId}, resume: ${!!resume})`);
 
     const startTime = Date.now();
     let outputBuffer = '';
@@ -456,33 +463,32 @@ class Worker {
         cwd: context?.cwd || this.config.workDir,
         timeout: timeout || 300000,
         files: context?.files || [],
-        env: context?.environment || {}
+        env: context?.environment || {},
+        sessionId: effectiveSessionId,
+        resume: !!resume
       };
 
       // 流式执行
       for await (const chunk of this.claudeExecutor.execute(prompt, options)) {
-        if (chunk.type === 'stdout' || chunk.type === 'stderr') {
-          // 发送流式输出到 Server
-          const outputType = chunk.type === 'stderr' ? 'stderr' : 'stdout';
-          this.socketClient.sendClaudeOutput(taskId, chunk.data, outputType);
-          outputBuffer += chunk.data;
-
-          if (chunk.type === 'stderr') {
-            hasError = true;
-          }
+        if (chunk.type === 'pty') {
+          // PTY 原始输出 — 直接转发到前端 xterm.js
+          this.socketClient.sendClaudeOutput(taskId, chunk.data, 'pty');
         } else if (chunk.type === 'error') {
           this.socketClient.sendClaudeOutput(taskId, `错误: ${chunk.data}\n`, 'error');
           hasError = true;
         } else if (chunk.type === 'complete') {
           const duration = Date.now() - startTime;
-          const summary = chunk.summary || outputBuffer.substring(outputBuffer.length - 200);
+          const summary = chunk.summary || '';
+
+          this.taskSessions.set(taskId, effectiveSessionId);
 
           this.socketClient.sendClaudeComplete(
             taskId,
-            hasError ? 1 : 0,
+            chunk.exitCode ?? (hasError ? 1 : 0),
             duration,
             summary,
-            requestId
+            requestId,
+            effectiveSessionId
           );
         }
       }
@@ -493,7 +499,7 @@ class Worker {
       console.error(`[Worker] Claude Code 执行失败:`, error.message);
 
       this.socketClient.sendClaudeOutput(taskId, `执行错误: ${error.message}\n`, 'error');
-      this.socketClient.sendClaudeComplete(taskId, -1, duration, error.message, requestId);
+      this.socketClient.sendClaudeComplete(taskId, -1, duration, error.message, requestId, effectiveSessionId);
     } finally {
       this.status = 'idle';
       this.currentTask = null;
@@ -599,7 +605,7 @@ class Worker {
         status: this.status,
         currentTask: this.currentTask ? this.currentTask.description : '',
         cpuUsage: metrics.cpuUsage,
-        memoryUsage: metrics.memoryUsageMB,
+        memoryUsage: metrics.memoryPercent,
         diskUsage: metrics.diskUsage,
         uptime: metrics.uptime
       });

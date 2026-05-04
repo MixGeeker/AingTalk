@@ -5,3 +5,4 @@ uploads/
 .env
 .DS_Store
 config.local.json
+test

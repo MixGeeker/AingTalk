@@ -39,6 +39,13 @@ class SocketClient {
     // 用于流式输出控制
     this.activeClaudeTask = null;
 
+    // 文件传输发送方回调
+    this.fileRequestAckCallback = null;
+    this.fileReadyCallback = null;
+    this.fileChunkAckCallback = null;
+    this.fileRejectedCallback = null;
+    this.fileErrorCallback = null;
+
     // Agent 列表缓存和待处理请求
     this._agentCache = null;
     this._pendingRequests = new Map();
@@ -225,6 +232,45 @@ class SocketClient {
 
       if (this.fileCompleteCallback) {
         this.fileCompleteCallback(data);
+      }
+    });
+
+    // 文件请求确认（发送方收到 Server 已处理请求）
+    this.socket.on('file:request:ack', (data) => {
+      if (this.fileRequestAckCallback) {
+        this.fileRequestAckCallback(data);
+      }
+    });
+
+    // 文件就绪（接收方已接受，发送方可以开始传块）
+    this.socket.on('file:ready', (data) => {
+      if (data.accepted && this.fileReadyCallback) {
+        this.fileReadyCallback(data);
+      }
+    });
+
+    // 文件块确认（Server 收到块后回执）
+    this.socket.on('file:chunk:ack', (data) => {
+      if (this.fileChunkAckCallback) {
+        this.fileChunkAckCallback(data);
+      }
+    });
+
+    // 文件被拒绝
+    this.socket.on('file:rejected', (data) => {
+      console.log(`[SocketClient] 文件被拒绝: ${data.fileId}, 原因: ${data.reason}`);
+
+      if (this.fileRejectedCallback) {
+        this.fileRejectedCallback(data);
+      }
+    });
+
+    // 文件传输错误
+    this.socket.on('file:error', (data) => {
+      console.error(`[SocketClient] 文件传输错误: ${data.fileId}, ${data.error}`);
+
+      if (this.fileErrorCallback) {
+        this.fileErrorCallback(data);
       }
     });
 
@@ -463,7 +509,8 @@ class SocketClient {
     this.socket.emit('claude:output', {
       taskId,
       chunk: chunk.toString(),
-      type
+      type,
+      agentId: this.agentId
     });
     return true;
   }
@@ -475,7 +522,7 @@ class SocketClient {
    * @param {number} duration - 执行时长(ms)
    * @param {string} summary - 摘要
    */
-  sendClaudeComplete(taskId, exitCode, duration, summary = '', requestId = null) {
+  sendClaudeComplete(taskId, exitCode, duration, summary = '', requestId = null, sessionId = null) {
     if (!this.socket || !this.connected) {
       return false;
     }
@@ -485,7 +532,8 @@ class SocketClient {
       exitCode,
       duration,
       summary,
-      requestId
+      requestId,
+      sessionId
     });
     this.activeClaudeTask = null;
     return true;
@@ -534,6 +582,26 @@ class SocketClient {
 
   onFileComplete(callback) {
     this.fileCompleteCallback = callback;
+  }
+
+  onFileRequestAck(callback) {
+    this.fileRequestAckCallback = callback;
+  }
+
+  onFileReady(callback) {
+    this.fileReadyCallback = callback;
+  }
+
+  onFileChunkAck(callback) {
+    this.fileChunkAckCallback = callback;
+  }
+
+  onFileRejected(callback) {
+    this.fileRejectedCallback = callback;
+  }
+
+  onFileError(callback) {
+    this.fileErrorCallback = callback;
   }
 
   onRoleAssign(callback) {
@@ -606,7 +674,7 @@ class SocketClient {
    * @param {number} [params.timeout] - 超时时间
    * @returns {Promise<Object>} 执行结果
    */
-  sendClaudeExecuteRequest({ targetAgentId, taskId, prompt, context = {}, timeout = 300000 }) {
+  sendClaudeExecuteRequest({ targetAgentId, taskId, prompt, context = {}, timeout = 300000, sessionId = null, resume = false }) {
     return new Promise((resolve, reject) => {
       if (!this.socket || !this.connected) {
         reject(new Error('Socket 未连接'));
@@ -635,9 +703,25 @@ class SocketClient {
         prompt,
         context,
         timeout,
-        fromAgentId: this.agentId
+        fromAgentId: this.agentId,
+        sessionId,
+        resume
       });
     });
+  }
+
+  /**
+   * 发送 Claude Code 取消请求（直接发送，不等待响应）
+   * @param {string} taskId - 任务 ID
+   * @param {string} targetAgentId - 目标 Agent ID
+   */
+  _sendCancel(taskId, targetAgentId) {
+    if (!this.socket || !this.connected) {
+      return false;
+    }
+
+    this.socket.emit('claude:cancel', { taskId, targetAgentId });
+    return true;
   }
 
   /**

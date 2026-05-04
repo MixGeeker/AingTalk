@@ -1,30 +1,49 @@
 /**
  * ClaudeCodeExecutor - Claude Code CLI 执行器
- * 执行 Claude Code 命令，支持流式输出、超时控制、取消操作
- * 使用 cross-spawn 实现跨平台兼容
+ * 使用 node-pty 创建伪终端，完整镜像 Claude Code TUI
+ * 版本检查等简单命令仍用 cross-spawn
  */
 
+const pty = require('node-pty');
 const spawn = require('cross-spawn');
 const { EventEmitter } = require('events');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 const commandExists = require('command-exists');
+
+// ANSI 转义序列正则，用于生成纯文本摘要
+const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[a-zA-Z]/g;
+
+/**
+ * 解析命令的完整路径（node-pty 不自动解析 PATH）
+ */
+function resolveCommand(cmd) {
+  try {
+    if (process.platform === 'win32') {
+      const result = execSync(`where ${cmd}`, { encoding: 'utf8', timeout: 5000 }).trim();
+      // where 可能返回多个结果，取第一个
+      return result.split('\n')[0].trim();
+    } else {
+      return execSync(`which ${cmd}`, { encoding: 'utf8' }).trim();
+    }
+  } catch {
+    return cmd;
+  }
+}
 
 class ClaudeCodeExecutor extends EventEmitter {
   constructor(options = {}) {
     super();
     this.claudePath = options.claudeCodePath || 'claude';
+    this._resolvedPath = null; // 缓存解析后的路径
     this.workDir = options.workDir || process.cwd();
-    this.defaultTimeout = options.defaultTimeout || 300000; // 默认 5 分钟
+    this.defaultTimeout = options.defaultTimeout || 300000;
     this.version = null;
     this._available = null;
-    this.activeTasks = new Map(); // taskId -> child process
+    this.activeTasks = new Map(); // taskId -> IPty
   }
 
-  /**
-   * 检查 Claude Code 是否可用
-   * @returns {Promise<boolean>}
-   */
   async isAvailable() {
     if (this._available !== null) {
       return this._available;
@@ -39,10 +58,6 @@ class ClaudeCodeExecutor extends EventEmitter {
     return this._available;
   }
 
-  /**
-   * 获取 Claude Code 版本
-   * @returns {Promise<string>}
-   */
   async getVersion() {
     if (this.version) {
       return this.version;
@@ -53,11 +68,10 @@ class ClaudeCodeExecutor extends EventEmitter {
     }
 
     try {
-      // 尝试各种方式获取版本
       const versionFlags = ['--version', '-v', 'version'];
       for (const flag of versionFlags) {
         try {
-          const result = await this.#runCommand([flag], { timeout: 10000, streaming: false });
+          const result = await this.#runCommand([flag], { timeout: 10000 });
           if (result.stdout) {
             this.version = result.stdout.trim();
             return this.version;
@@ -75,8 +89,7 @@ class ClaudeCodeExecutor extends EventEmitter {
   }
 
   /**
-   * 执行 Claude Code 命令（流式输出）
-   * 返回 AsyncGenerator，支持 for await...of 遍历
+   * 执行 Claude Code 命令（PTY 模式，完整 TUI 镜像）
    * @param {string} prompt - 提示词/指令
    * @param {Object} options - 执行选项
    * @param {string} [options.cwd] - 工作目录
@@ -84,7 +97,11 @@ class ClaudeCodeExecutor extends EventEmitter {
    * @param {string[]} [options.files] - 相关文件列表
    * @param {Object} [options.env] - 额外环境变量
    * @param {string} [options.taskId] - 任务 ID
-   * @returns {AsyncGenerator<{type: string, data: string, done?: boolean}>}
+   * @param {string} [options.sessionId] - Claude Code 会话 ID
+   * @param {boolean} [options.resume] - 是否恢复已有会话
+   * @param {number} [options.cols] - PTY 列数
+   * @param {number} [options.rows] - PTY 行数
+   * @returns {AsyncGenerator}
    */
   async* execute(prompt, options = {}) {
     const {
@@ -92,17 +109,19 @@ class ClaudeCodeExecutor extends EventEmitter {
       timeout = this.defaultTimeout,
       files = [],
       env = {},
-      taskId = `claude_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      taskId = `claude_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      sessionId = null,
+      resume = false,
+      cols = 120,
+      rows = 30
     } = options;
 
-    // 验证可用性
     if (!(await this.isAvailable())) {
       yield { type: 'error', data: 'Claude Code 不可用，请确保已安装 claude 命令' };
       yield { type: 'complete', data: '', exitCode: -1, duration: 0 };
       return;
     }
 
-    // 验证工作目录
     if (!fs.existsSync(cwd)) {
       yield { type: 'error', data: `工作目录不存在: ${cwd}` };
       yield { type: 'complete', data: '', exitCode: -1, duration: 0 };
@@ -110,31 +129,34 @@ class ClaudeCodeExecutor extends EventEmitter {
     }
 
     const startTime = Date.now();
-    const outputBuffer = [];
+    const outputChunks = [];
 
     try {
-      // 构建命令参数
-      const args = this.#buildArgs(prompt, files);
+      const args = this.#buildArgs(prompt, files, { sessionId, resume });
 
-      console.log(`[ClaudeCodeExecutor] 执行任务 ${taskId}: ${prompt.substring(0, 100)}...`);
-      console.log(`[ClaudeCodeExecutor] 工作目录: ${cwd}`);
+      // 解析 claude 的完整路径（node-pty 不自动解析 PATH）
+      if (!this._resolvedPath) {
+        this._resolvedPath = resolveCommand(this.claudePath);
+        console.log(`[ClaudeCodeExecutor] claude 解析路径: ${this._resolvedPath}`);
+      }
 
-      // 创建子进程
-      const child = spawn(this.claudePath, args, {
+      console.log(`[ClaudeCodeExecutor] PTY 执行任务 ${taskId}: ${prompt.substring(0, 100)}...`);
+      console.log(`[ClaudeCodeExecutor] 工作目录: ${cwd}, PTY: ${cols}x${rows}`);
+
+      // 创建 PTY 伪终端
+      const ptyProcess = pty.spawn(this._resolvedPath, args, {
+        name: 'xterm-256color',
+        cols,
+        rows,
         cwd,
         env: {
           ...process.env,
           ...env,
-          FORCE_COLOR: '1',
-          CLAUDE_CODE_DEBUG: '1',
           TERM: 'xterm-256color'
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true
+        }
       });
 
-      // 记录活动任务
-      this.activeTasks.set(taskId, child);
+      this.activeTasks.set(taskId, ptyProcess);
       this.emit('task:start', { taskId, prompt, cwd });
 
       // 超时处理
@@ -142,62 +164,55 @@ class ClaudeCodeExecutor extends EventEmitter {
       let timedOut = false;
 
       if (timeout > 0) {
-        let forceKill = null;
         timeoutTimer = setTimeout(() => {
           timedOut = true;
           console.warn(`[ClaudeCodeExecutor] 任务 ${taskId} 超时，正在终止...`);
-          child.kill('SIGTERM');
-
-          // 5秒后强制终止，存储以便清理
-          forceKill = setTimeout(() => {
-            if (!child.killed) {
-              child.kill('SIGKILL');
-            }
-          }, 5000);
-          child.once('close', () => {
-            if (forceKill) clearTimeout(forceKill);
-          });
+          try { ptyProcess.kill(); } catch {}
         }, timeout);
       }
 
-      // 使用 Promise 包装以便在 generator 中使用
-      const outputPromise = this.#collectOutput(child, taskId, timeoutTimer);
+      // 收集 PTY 输出
+      const iterator = this.#collectPtyOutput(ptyProcess, taskId, timeoutTimer);
 
-      // 发送输入（如果需要）
-      if (child.stdin && child.stdin.writable) {
-        // Claude Code 通常通过命令行参数接收输入
-        child.stdin.end();
-      }
-
-      // 流式输出
-      for await (const chunk of outputPromise) {
-        outputBuffer.push(chunk);
+      for await (const chunk of iterator) {
+        outputChunks.push(chunk);
         yield chunk;
       }
 
       const duration = Date.now() - startTime;
-
-      // 任务完成
       this.activeTasks.delete(taskId);
+
+      const idleComplete = outputChunks.find(c => c.type === 'idle-complete');
 
       if (timedOut) {
         this.emit('task:timeout', { taskId, duration });
         yield {
           type: 'complete',
-          data: outputBuffer.filter(c => c.type === 'stdout').map(c => c.data).join(''),
+          data: '',
           exitCode: -1,
           duration,
           error: '执行超时'
         };
-      } else {
-        const lastChunk = outputBuffer[outputBuffer.length - 1];
-        this.emit('task:complete', { taskId, duration, exitCode: lastChunk?.exitCode ?? 0 });
+      } else if (idleComplete) {
+        // TUI 空闲检测：Claude Code 已完成响应
+        this.emit('task:complete', { taskId, duration, exitCode: 0 });
         yield {
           type: 'complete',
-          data: outputBuffer.filter(c => c.type === 'stdout').map(c => c.data).join(''),
-          exitCode: lastChunk?.exitCode ?? 0,
+          data: '',
+          exitCode: 0,
           duration,
-          summary: this.#generateSummary(outputBuffer)
+          summary: this.#generateSummary(outputChunks)
+        };
+      } else {
+        const exitChunk = outputChunks.find(c => c.type === 'exit');
+        const exitCode = exitChunk?.exitCode ?? 0;
+        this.emit('task:complete', { taskId, duration, exitCode });
+        yield {
+          type: 'complete',
+          data: '',
+          exitCode,
+          duration,
+          summary: this.#generateSummary(outputChunks)
         };
       }
 
@@ -211,7 +226,7 @@ class ClaudeCodeExecutor extends EventEmitter {
       yield { type: 'error', data: error.message };
       yield {
         type: 'complete',
-        data: outputBuffer.filter(c => c.type === 'stdout').map(c => c.data).join(''),
+        data: '',
         exitCode: -1,
         duration,
         error: error.message
@@ -221,23 +236,12 @@ class ClaudeCodeExecutor extends EventEmitter {
 
   /**
    * 取消正在执行的任务
-   * @param {string} taskId - 任务 ID
-   * @returns {boolean}
    */
   cancel(taskId) {
-    const child = this.activeTasks.get(taskId);
-    if (child) {
+    const ptyProcess = this.activeTasks.get(taskId);
+    if (ptyProcess) {
       console.log(`[ClaudeCodeExecutor] 取消任务 ${taskId}`);
-      child.kill('SIGTERM');
-
-      // 5 秒后强制终止，存储 timer 以便 close 时清理
-      const forceKill = setTimeout(() => {
-        if (!child.killed) {
-          child.kill('SIGKILL');
-        }
-      }, 5000);
-      child.once('close', () => clearTimeout(forceKill));
-
+      try { ptyProcess.kill(); } catch {}
       this.activeTasks.delete(taskId);
       this.emit('task:cancelled', { taskId });
       return true;
@@ -245,33 +249,31 @@ class ClaudeCodeExecutor extends EventEmitter {
     return false;
   }
 
-  /**
-   * 取消所有任务
-   */
   cancelAll() {
     for (const [taskId] of this.activeTasks) {
       this.cancel(taskId);
     }
   }
 
-  /**
-   * 获取活动任务列表
-   * @returns {string[]}
-   */
   getActiveTasks() {
     return Array.from(this.activeTasks.keys());
   }
 
   // ==================== 私有方法 ====================
 
-  /**
-   * 构建 Claude Code 命令参数
-   * @private
-   */
-  #buildArgs(prompt, files) {
+  #buildArgs(prompt, files, sessionOpts = {}) {
     const args = [];
+    const { sessionId, resume } = sessionOpts;
 
-    // 添加文件参数
+    // 不用 -p，保持完整 TUI 模式；跳过权限确认避免卡住
+    args.push('--dangerously-skip-permissions');
+
+    if (resume && sessionId) {
+      args.push('--resume', sessionId);
+    } else if (sessionId) {
+      args.push('--session-id', sessionId);
+    }
+
     if (files && files.length > 0) {
       for (const file of files) {
         if (fs.existsSync(file)) {
@@ -280,9 +282,6 @@ class ClaudeCodeExecutor extends EventEmitter {
       }
     }
 
-    // 添加提示词 - 作为位置参数
-    // Claude Code 支持: claude "prompt text"
-    // 也支持通过 stdin 输入
     if (prompt) {
       args.push(prompt);
     }
@@ -291,19 +290,18 @@ class ClaudeCodeExecutor extends EventEmitter {
   }
 
   /**
-   * 收集子进程输出（async generator 辅助方法）
+   * 收集 PTY 输出（async generator）
+   * PTY 只有单一数据流，不区分 stdout/stderr
+   * TUI 模式下 Claude Code 不会自动退出，用空闲检测判断完成
    * @private
    */
-  #collectOutput(child, taskId, timeoutTimer) {
-    const chunks = [];
-
+  #collectPtyOutput(ptyProcess, taskId, timeoutTimer, idleTimeout = 15000) {
     return {
       [Symbol.asyncIterator]() {
-        let stdoutEnded = false;
-        let stderrEnded = false;
         let closed = false;
         let buffer = [];
         let resolveNext = null;
+        let idleTimer = null;
 
         const pushChunk = (chunk) => {
           if (resolveNext) {
@@ -321,55 +319,37 @@ class ClaudeCodeExecutor extends EventEmitter {
           }
         };
 
-        child.stdout?.on('data', (data) => {
-          const text = data.toString('utf8');
-          const chunk = { type: 'stdout', data: text, taskId };
-          chunks.push(chunk);
-          pushChunk(chunk);
+        // 重置空闲计时器：每次收到 PTY 数据都重置
+        const resetIdleTimer = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            if (closed) return;
+            console.log(`[ClaudeCodeExecutor] TUI 空闲 ${idleTimeout / 1000}s，判定任务完成: ${taskId}`);
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            closed = true;
+            pushChunk({ type: 'idle-complete', taskId });
+            checkDone();
+            try { ptyProcess.kill(); } catch {}
+          }, idleTimeout);
+        };
+
+        // PTY 数据事件 — raw terminal bytes
+        ptyProcess.onData((data) => {
+          resetIdleTimer();
+          pushChunk({ type: 'pty', data, taskId });
         });
 
-        child.stderr?.on('data', (data) => {
-          const text = data.toString('utf8');
-          const chunk = { type: 'stderr', data: text, taskId };
-          chunks.push(chunk);
-          pushChunk(chunk);
-        });
-
-        child.stdout?.on('end', () => {
-          stdoutEnded = true;
-          if (stderrEnded || !child.stderr) {
-            // 可能还需要等一下 close 事件获取 exitCode
-          }
-        });
-
-        child.stderr?.on('end', () => {
-          stderrEnded = true;
-        });
-
-        child.on('close', (exitCode) => {
-          if (timeoutTimer) {
-            clearTimeout(timeoutTimer);
-          }
+        // PTY 退出事件
+        ptyProcess.onExit(({ exitCode }) => {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (idleTimer) clearTimeout(idleTimer);
           closed = true;
-          if (resolveNext) {
-            resolveNext({
-              value: { type: 'exit', exitCode, taskId },
-              done: false
-            });
-            resolveNext = null;
-          } else {
-            buffer.push({ type: 'exit', exitCode, taskId });
-          }
+          pushChunk({ type: 'exit', exitCode, taskId });
           checkDone();
         });
 
-        child.on('error', (error) => {
-          closed = true;
-          const chunk = { type: 'error', data: error.message, taskId };
-          chunks.push(chunk);
-          pushChunk(chunk);
-          checkDone();
-        });
+        // 启动首次空闲计时
+        resetIdleTimer();
 
         return {
           next() {
@@ -389,7 +369,7 @@ class ClaudeCodeExecutor extends EventEmitter {
   }
 
   /**
-   * 运行简单命令（非流式）
+   * 运行简单命令（非 PTY，用于版本检查等）
    * @private
    */
   #runCommand(args, options = {}) {
@@ -432,21 +412,27 @@ class ClaudeCodeExecutor extends EventEmitter {
   }
 
   /**
-   * 生成执行摘要
+   * 从 PTY 输出中生成纯文本摘要（去除 ANSI 转义序列）
    * @private
    */
   #generateSummary(chunks) {
-    const stdout = chunks
-      .filter(c => c.type === 'stdout')
+    const raw = chunks
+      .filter(c => c.type === 'pty')
       .map(c => c.data)
       .join('');
 
-    // 取最后 200 字符作为摘要
-    const trimmed = stdout.trim();
-    if (trimmed.length > 200) {
-      return trimmed.substring(trimmed.length - 200);
+    const plain = raw.replace(ANSI_RE, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 0)
+      .join(' ');
+
+    if (plain.length > 200) {
+      return plain.substring(plain.length - 200);
     }
-    return trimmed;
+    return plain;
   }
 }
 

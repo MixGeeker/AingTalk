@@ -74,6 +74,13 @@ class SocketHandler {
 
     socket.on('message', (message) => {
       console.log(`[Socket] Message from ${message.from} to ${message.to}, type: ${message.type}`);
+      // 补充消息 ID 和时间戳（兼容不携带这些字段的客户端）
+      if (!message.id) {
+        message.id = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      }
+      if (!message.timestamp) {
+        message.timestamp = Date.now();
+      }
       this.messageRouter.routeMessage(message);
     });
 
@@ -130,7 +137,8 @@ class SocketHandler {
           taskId: data.taskId,
           exitCode: data.exitCode,
           duration: data.duration,
-          summary: data.summary
+          summary: data.summary,
+          sessionId: data.sessionId || null
         });
       }
     });
@@ -201,8 +209,27 @@ class SocketHandler {
         context: data.context || {},
         timeout: data.timeout || 300000,
         requestId: data.requestId,
-        fromAgentId: data.fromAgentId
+        fromAgentId: data.fromAgentId,
+        sessionId: data.sessionId || null,
+        resume: data.resume || false
       });
+    });
+
+    // === Claude Code 取消请求 ===
+    socket.on('claude:cancel', (data) => {
+      if (!data || !data.targetAgentId || !data.taskId) {
+        console.warn('[Socket] Invalid claude:cancel payload');
+        return;
+      }
+
+      const targetAgent = this.agentManager.getAgent(data.targetAgentId);
+      if (!targetAgent || !targetAgent.socketId) {
+        console.warn(`[Socket] claude:cancel target not found: ${data.targetAgentId}`);
+        return;
+      }
+
+      console.log(`[Socket] Claude cancel: ${data.taskId} -> ${data.targetAgentId}`);
+      this.io.to(targetAgent.socketId).emit('claude:cancel', { taskId: data.taskId });
     });
 
     // 前端加入监控面板
@@ -214,19 +241,6 @@ class SocketHandler {
       socket.emit('message:history', this.messageRouter.getMessages({ limit: 100 }));
       // 发送系统统计
       socket.emit('system:stats', agentStore.getStats());
-    });
-
-    // 前端发送消息
-    socket.on('send-message', (message) => {
-      console.log(`[Socket] Send message from frontend:`, message);
-      // 补充消息 ID 和时间戳
-      if (!message.id) {
-        message.id = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      }
-      if (!message.timestamp) {
-        message.timestamp = Date.now();
-      }
-      this.messageRouter.routeMessage(message);
     });
 
     // 前端请求 Agent 状态

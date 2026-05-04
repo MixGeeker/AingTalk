@@ -207,7 +207,7 @@ async function main() {
     assert(beta, 'Worker-Beta 未找到');
 
     // 通过 send-message 事件发送（模拟 Frontend/MCP 发送）
-    socket.emit('send-message', {
+    socket.emit('message', {
       id: testMsgId1,
       from: alpha.id,
       fromName: 'Worker-Alpha',
@@ -241,7 +241,7 @@ async function main() {
     const alpha = agents.find(a => a.name === 'Worker-Alpha');
     const beta = agents.find(a => a.name === 'Worker-Beta');
 
-    socket.emit('send-message', {
+    socket.emit('message', {
       id: testMsgId2,
       from: beta.id,
       fromName: 'Worker-Beta',
@@ -262,7 +262,7 @@ async function main() {
 
   await test('Step 2.3: 广播消息', async () => {
     const testBroadcastId = `test-broadcast-${Date.now()}`;
-    socket.emit('send-message', {
+    socket.emit('message', {
       id: testBroadcastId,
       from: orchestratorId,
       fromName: 'TestOrchestrator',
