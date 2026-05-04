@@ -1,257 +1,198 @@
-# Agent 联调测试平台
+# AingTalk
 
-基于 Socket.io 的多 Agent 联调测试基建系统，支持本地 Claude Code 联动调试、开发、反馈。
+基于 Socket.io 的多 Agent 协作平台，支持 Claude Code 跨机器协同调试、远程任务分发与实时终端监控。
 
 ## 系统架构
 
 ```
-+-----------------------------------------+
-|              Vue.js 前端                  |
-|         (监控面板 & 聊天界面)               |
-+-----------------------------------------+
-                    |
-                    | Socket.io
-                    v
-+-----------------------------------------+
-|           Node.js Server                |
-|    (消息路由 / Agent管理 / 心跳检测)       |
-+-----------------------------------------+
-                    |
-        +-----------+-----------+
-        |                       |
-   Socket.io               Socket.io
-        |                       |
-   +----v-----+           +-----v----+
-   | Worker   |           |  Worker  |
-   | (MacOS)  |           |(Windows) |
-   |Claude Code|          |Claude Code|
-   +----------+           +----------+
++-----------------------------------------------------------+
+|                    Vue.js 前端                              |
+|          (Agent 监控 & 终端网格 & 状态面板)                    |
++-----------------------------------------------------------+
+                          |
+                          | Socket.io
+                          v
++-----------------------------------------------------------+
+|                    Node.js Server                          |
+|       (消息路由 / Agent管理 / 心跳检测 / MCP中继)             |
++-----------------------------------------------------------+
+                          |
+              +-----------+-----------+
+              |                       |
+         Socket.io               Socket.io (MCP)
+              |                       |
+         +----v-----+           +-----v-----+
+         |  Worker  |           |  Worker   |
+         | (Agent)  |           | (Agent)   |
+         |Claude Code|          | Claude Code|
+         | PTY 执行器 |         | PTY 执行器  |
+         | MCP Server|          | MCP Server |
+         +----------+           +-----------+
 ```
+
+## 核心特性
+
+- **MCP Server 集成** — Worker 内置 MCP Server，Claude Code 可直接通过 MCP 工具调用远程 Agent 能力
+- **远程任务分发** — 向任意在线 Agent 派发 Claude Code 执行任务，支持会话续接（continue_task）
+- **终端网格监控** — 前端以网格布局实时展示每个 Agent 的 Claude Code 终端输出（xterm.js）
+- **跨机器文件传输** — Agent 间分块传输文件，支持压缩包、代码、数据等常见类型
+- **BTW 旁路询问** — 低优先级消息，不打断 Agent 当前工作
+- **心跳与健康监测** — 实时追踪 Agent 在线状态、CPU/内存/磁盘使用率
 
 ## 快速开始
 
-### 1. 部署 Server (Docker)
+### 1. 安装依赖
 
 ```bash
-# 方式一: Docker Compose (推荐)
-docker-compose up -d
-
-# 方式二: 手动构建
-cd server
-docker build -t agent-collab-server .
-docker run -d -p 3000:3000 agent-collab-server
+pnpm install
 ```
 
-### 2. 部署 Worker
+### 2. 部署 Server
 
-#### Mac OS
+```bash
+# 开发模式 (nodemon 热重载)
+pnpm dev:server
+
+# 生产模式
+cd server && pnpm start
+
+# Docker
+pnpm docker:up
+# 或
+docker-compose up -d
+```
+
+Server 默认监听端口 `3000`，可通过环境变量 `PORT` 修改。
+
+### 3. 部署 Worker
 
 ```bash
 cd worker
 cp config.example.json config.json
 # 编辑 config.json 填写 serverUrl、name、workDir
-npm install
-chmod +x scripts/start.sh
-./scripts/start.sh
+pnpm start
 ```
 
-#### Windows 11
-
-```cmd
-cd worker
-copy config.example.json config.json
-:: 编辑 config.json 填写 serverUrl、name、workDir
-npm install
-scripts\start.bat
-```
-
-#### 命令行参数方式 (无需配置文件)
+或通过命令行参数启动：
 
 ```bash
 # Mac/Linux
-node src/index.js --server http://192.168.1.100:3000 --name "调试用机器" --workDir /Users/dev/projects
+node src/index.js --server http://192.168.1.100:3000 --name "MacBook-Pro" --workDir ~/projects
 
 # Windows
-node src/index.js --server http://192.168.1.100:3000 --name "调试机-Win" --workDir C:\Users\dev\projects
+node src/index.js --server http://192.168.1.100:3000 --name "Win-Dev" --workDir C:\Users\dev\projects
 ```
-
-### 3. 环境变量配置
-
-| 环境变量 | 说明 | 示例 |
-|---------|------|------|
-| `AGENT_SERVER_URL` | Server 地址 | `http://localhost:3000` |
-| `AGENT_NAME` | Agent 名称 | `调试用机器` |
-| `AGENT_WORK_DIR` | 工作目录 | `/Users/dev/projects` |
-| `AGENT_HEARTBEAT_INTERVAL` | 心跳间隔(ms) | `30000` |
-| `AGENT_CLAUDE_CODE_PATH` | Claude Code 路径 | `claude` |
 
 ### 4. 开发前端
 
 ```bash
-cd frontend
-npm install
-npm run dev        # 开发服务器 http://localhost:5173
-npm run build      # 生产构建 (输出到 dist/)
+pnpm dev:frontend      # 开发服务器 http://localhost:5173，自动代理到 :3000
+cd frontend && pnpm build  # 生产构建
 ```
 
-## 核心功能
+## MCP Server
 
-### Agent 间通讯
+Worker 内置 MCP (Model Context Protocol) Server，Claude Code 通过 stdio 连接后可使用以下工具：
 
-- **定向消息**: Agent A -> Agent B 的私密消息
-- **广播消息**: 发送给所有在线 Agent
-- **角色分配**: 给 Agent 分配角色和职责
-- **任务分配**: 给 Agent 指派具体任务
-- **状态查询**: 查询 Agent 当前工作状态
+| 工具 | 说明 | 参数 |
+|------|------|------|
+| `list_agents` | 获取所有在线 Agent 列表 | — |
+| `get_agent_info` | 获取指定 Agent 详细信息 | `agent_name` |
+| `send_message` | 向 Agent 发送消息 | `target_agent`, `message`, `type?` (text/btw) |
+| `send_task` | 向远程 Agent 派发 Claude Code 任务 | `target_agent`, `prompt`, `task_description?`, `timeout?` (10s-5h) |
+| `continue_task` | 续接已有会话 | `session_id`, `target_agent`, `prompt`, `timeout?` |
+| `cancel_task` | 取消正在执行的任务 | `task_id`, `target_agent` |
+| `send_file` | 向远程 Agent 发送文件 | `file_path`, `target_agent`, `description?` |
 
-### BTW 旁路询问
+### 使用示例
 
-一种特殊的低优先级消息类型，用于在不打断当前任务的情况下进行询问。
+在 Claude Code 中配置 MCP Server 后，即可通过自然语言调用：
 
-```javascript
-// Leader Agent 发送 BTW
-socket.emit('message', {
-  type: 'btw',
-  to: 'worker-agent-id',
-  content: '你目前调试进度到哪里了？',
-  metadata: { isBtw: true, urgency: 'normal' }
-});
+```
+"查看当前有哪些 Agent 在线"
+"让 Macbook-Pro 帮我分析一下 server/src/index.js 的代码质量"
+"发送本地的 config.json 给 Win-Dev"
 ```
 
-### 心跳机制
+## 环境变量
 
-- Worker 每 30 秒发送心跳
-- Server 每 15 秒检查超时
-- 超过 90 秒无心跳标记为离线
-- 前端实时显示心跳延迟
-
-### 文件传输
-
-- 支持压缩包: `.zip`, `.tar.gz`, `.tgz`, `.7z`, `.rar`
-- 支持代码文件: `.js`, `.ts`, `.py`, `.java`, `.go`, `.rs`, `.c`, `.cpp`
-- 支持数据文件: `.json`, `.xml`, `.yaml`, `.csv`, `.md`, `.txt`, `.log`
-- 单文件最大 100MB
-- 分块传输 (64KB/块)
+| 环境变量 | 说明 | 默认值 |
+|---------|------|--------|
+| **Server** | | |
+| `PORT` | 服务端口 | `3000` |
+| `NODE_ENV` | 运行环境 | `development` |
+| `CORS_ORIGIN` | CORS 源 | `*` |
+| `HEARTBEAT_TIMEOUT` | 心跳超时(ms) | `90000` |
+| **Worker** | | |
+| `AGENT_SERVER_URL` | Server 地址 | — |
+| `AGENT_NAME` | Agent 名称 | — |
+| `AGENT_WORK_DIR` | 工作目录 | — |
+| `AGENT_HEARTBEAT_INTERVAL` | 心跳间隔(ms) | `30000` |
+| `AGENT_AUTO_RECONNECT` | 自动重连 | `true` |
+| `AGENT_CLAUDE_CODE_PATH` | Claude Code 路径 | `claude` |
 
 ## 部署场景示例
 
-### 场景：跨机器联调调试
-
-**机器 A (MacBook - 开发机)**
+**机器 A (MacBook — 开发机 / Leader)**
 ```bash
-# 部署 Worker
-node worker/src/index.js -s http://server-ip:3000 -n "Leader开发机" -w ~/my-project
-# 然后告诉 Claude Code: "你是开发负责人，协调其他机器进行调试"
+node worker/src/index.js -s http://server-ip:3000 -n "Leader" -w ~/my-project
+# Claude Code 通过 MCP 工具协调其他机器
 ```
 
-**机器 B (Windows - 测试机)**
+**机器 B (Windows — 测试机)**
 ```bash
-# 部署 Worker
-node worker/src/index.js -s http://server-ip:3000 -n "调试用机器" -w C:\test-project
-# Leader Agent 可以发消息给它: "你是API调试专家，负责验证接口"
+node worker/src/index.js -s http://server-ip:3000 -n "Win-Test" -w C:\test-project
+# 接受 Leader 派发的任务，执行 Claude Code 分析
 ```
 
-**机器 C (Mac Mini - 构建机)**
+**机器 C (Linux — 构建机)**
 ```bash
-node worker/src/index.js -s http://server-ip:3000 -n "构建机器" -w ~/build
-# Leader Agent: "你是构建专家，负责编译和打包"
+node worker/src/index.js -s http://server-ip:3000 -n "Build-Bot" -w ~/build
+# 专注构建和打包任务
 ```
 
-## Worker 配置示例
-
-```json
-{
-  "serverUrl": "http://192.168.1.100:3000",
-  "name": "调试用机器",
-  "workDir": "/Users/dev/projects",
-  "heartbeatInterval": 30000,
-  "autoReconnect": true,
-  "reconnectInterval": 5000,
-  "maxReconnectAttempts": 10,
-  "capabilities": ["claude-code", "node", "git", "docker"],
-  "claudeCodePath": "claude",
-  "maxFileSize": 104857600,
-  "allowedFileTypes": [".zip", ".tar.gz", ".js", ".ts", ".py", ".json", ".md", ".txt"]
-}
-```
-
-## Socket.io 消息协议
+## Socket.io 协议
 
 ### Agent 注册
-```javascript
-socket.emit('agent:register', {
-  id: 'uuid-v4',
-  name: '调试用机器',
-  role: '',
-  hostname: 'macbook-pro',
-  platform: 'darwin',
-  arch: 'arm64',
-  workDir: '/Users/dev/projects',
-  capabilities: ['claude-code', 'node', 'git'],
-  claudeVersion: '1.x.x',
-  ip: '192.168.1.100',
-  startedAt: '2024-01-15T10:00:00Z'
-});
+
 ```
-
-### 发送消息
-```javascript
-// 普通消息
-socket.emit('message', {
-  from: 'agent-id-1',
-  to: 'agent-id-2',
-  type: 'text',
-  content: '你好，请介绍一下你的环境',
-  timestamp: Date.now()
-});
-
-// 角色分配
-socket.emit('message', {
-  from: 'leader-agent',
-  to: 'worker-agent',
-  type: 'role-assign',
-  content: '你被分配为 API调试专家',
-  metadata: { roleName: 'API调试专家', roleDescription: '负责调试API...' }
-});
-
-// BTW 旁路询问
-socket.emit('message', {
-  from: 'leader-agent',
-  to: 'worker-agent',
-  type: 'btw',
-  content: '进度到哪了？',
-  metadata: { isBtw: true, urgency: 'low' }
-});
+Worker → agent:register → Server 存储 → agent:registered (回复)
+                                    → agent:connected + agent:list (广播)
 ```
 
 ### 心跳
-```javascript
-// Worker -> Server (每 30 秒)
-socket.emit('heartbeat', {
-  agentId: 'uuid',
-  timestamp: Date.now(),
-  status: 'idle',
-  currentTask: '',
-  cpuUsage: 45.2,
-  memoryUsage: 67.8,
-  diskUsage: 82.1,
-  uptime: 3600
-});
 
-// Server -> Worker
-socket.on('heartbeat:ack', (data) => {});
+```
+Worker → heartbeat (每30s) → heartbeat:ack (回复)
+                           → heartbeat:update (广播至前端)
+Server 每15s 检查，90s 无心跳标记离线
+```
+
+### 消息路由
+
+```
+发送方 → message → MessageRouter → message:new (送达目标)
+                                → message:delivered (确认回发送方)
+BTW 消息: type='btw', metadata.isBtw=true
+```
+
+### Claude Code 任务执行
+
+```
+MCP/Server → claude:execute:request → Worker (PTY模式启动claude CLI)
+                                     → claude:output (流式输出)
+                                     → claude:complete (完成，含exitCode/时长/summary)
+                                     → claude:execute:result (回传结果)
+取消: claude:cancel → Worker 终止进程
 ```
 
 ### 文件传输
-```javascript
-// 发送文件请求
-socket.emit('file:request', { id, name, size, mimeType, from, to });
 
-// 响应
-socket.emit('file:response', { fileId, accepted: true });
-
-// 发送块
-socket.emit('file:chunk', { fileId, index, total, data });
+```
+发送方 → file:request → Server → file:incoming (转发至接收方)
+接收方 → file:response → Server → 发送方开始流式传输
+发送方 → file:chunk (64KB base64) → Server 中继至接收方
+全部传输完成 → file:complete
 ```
 
 ## REST API
@@ -259,66 +200,82 @@ socket.emit('file:chunk', { fileId, index, total, data });
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/agents` | Agent 列表 |
-| GET | `/api/agents/:id` | 单个 Agent |
+| GET | `/api/agents/:id` | 单个 Agent 详情 |
 | GET | `/api/agents/:id/messages` | Agent 消息历史 |
-| GET | `/api/agents/:id/status` | Agent 状态 |
+| GET | `/api/agents/:id/status` | Agent 状态与健康信息 |
 | POST | `/api/agents/:id/message` | 发送消息 |
-| GET | `/api/messages` | 所有消息 |
-| GET | `/api/transfers` | 传输记录 |
+| GET | `/api/messages` | 全部消息历史 |
+| GET | `/api/transfers` | 文件传输记录 |
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/stats` | 系统统计 |
 
 ## 项目结构
 
 ```
-agent-collab-platform/
-├── server/                    # Server 端
+AingTalk/
+├── server/                        # Server 端
 │   ├── src/
-│   │   ├── index.js           # 入口
-│   │   ├── socket/            # Socket.io 处理器
-│   │   │   ├── handler.js     # 主处理器
-│   │   │   ├── agent-manager.js
-│   │   │   ├── message-router.js
-│   │   │   ├── heartbeat.js
-│   │   │   └── file-handler.js
-│   │   ├── routes/api.js      # REST API
-│   │   ├── services/          # 数据存储
-│   │   └── middleware/        # 中间件
+│   │   ├── index.js               # Express + Socket.io 入口
+│   │   ├── socket/                # Socket.io 处理器
+│   │   │   ├── handler.js         # 主事件分发器
+│   │   │   ├── agent-manager.js   # Agent 管理
+│   │   │   ├── message-router.js  # 消息路由
+│   │   │   ├── heartbeat.js       # 心跳监控
+│   │   │   └── file-handler.js    # 文件传输
+│   │   ├── routes/api.js          # REST API
+│   │   ├── services/
+│   │   │   └── agent-store.js     # 内存数据存储
+│   │   └── middleware/
+│   │       └── static.js          # 静态文件 / SPA 回退
 │   ├── package.json
 │   └── Dockerfile
-├── worker/                    # Worker 端
+├── worker/                        # Worker 端
 │   ├── src/
-│   │   ├── index.js           # 入口
-│   │   ├── client/            # Socket.io 客户端
-│   │   ├── executor/          # Claude Code 执行器
-│   │   ├── collector/         # 系统状态收集
-│   │   ├── file-handler/      # 文件传输
-│   │   └── config/            # 配置加载
-│   ├── scripts/               # 启动脚本
-│   │   ├── start.bat          # Windows
-│   │   └── start.sh           # Mac/Linux
+│   │   ├── index.js               # Worker 入口
+│   │   ├── mcp-server.mjs         # MCP Server (7个工具)
+│   │   ├── client/
+│   │   │   └── socket-client.js   # Socket.io 客户端
+│   │   ├── executor/
+│   │   │   ├── claude-code.js     # PTY 模式 Claude Code 执行器
+│   │   │   └── command-runner.js  # 通用命令执行器
+│   │   ├── collector/
+│   │   │   └── system-info.js     # 系统信息采集
+│   │   ├── file-handler/
+│   │   │   └── file-transfer.js   # 分块文件传输
+│   │   └── config/
+│   │       └── loader.js          # 配置加载 (CLI > ENV > JSON > 默认值)
+│   ├── scripts/
+│   │   ├── start.bat              # Windows 启动脚本
+│   │   └── start.sh               # Mac/Linux 启动脚本
 │   ├── config.example.json
 │   └── package.json
-├── frontend/                  # Vue.js 前端
+├── frontend/                      # Vue.js 前端
 │   ├── src/
-│   │   ├── components/        # UI 组件
-│   │   ├── views/             # 页面视图
-│   │   ├── stores/            # Pinia 状态管理
-│   │   └── utils/             # 工具函数
+│   │   ├── components/
+│   │   │   ├── AgentList.vue      # Agent 列表与状态
+│   │   │   ├── ClaudeTerminal.vue # xterm.js 终端面板
+│   │   │   └── TerminalGrid.vue   # 自适应终端网格布局
+│   │   ├── views/
+│   │   │   └── Dashboard.vue      # 主面板
+│   │   ├── stores/
+│   │   │   └── socket.js          # Pinia 状态管理
+│   │   └── utils/
+│   │       └── format.js          # 格式化工具
 │   ├── package.json
 │   └── vite.config.js
 ├── docker-compose.yml
+├── CLAUDE.md
 └── README.md
 ```
 
 ## 技术栈
 
-- **通讯**: Socket.io v4
+- **通信**: Socket.io v4
 - **Server**: Node.js 20 + Express 4
-- **Worker**: Node.js 20 + Socket.io-client
-- **前端**: Vue.js 3 + Vite + Tailwind CSS + Pinia
-- **部署**: Docker (Server), 跨平台脚本 (Worker)
-- **AI 集成**: Claude Code CLI
+- **Worker**: Node.js 20 + node-pty + @modelcontextprotocol/sdk
+- **前端**: Vue.js 3 + Vite + Tailwind CSS + Pinia + xterm.js
+- **AI 集成**: Claude Code CLI (PTY 模式) + MCP Protocol
+- **部署**: Docker (Server)，跨平台脚本 (Worker)
 
 ## License
 
