@@ -237,7 +237,7 @@ async function main() {
       target_agent: z.string().describe('目标 Agent 的名称或 ID。该 Agent 必须在线且空闲（状态为 online 或 idle）。可通过 list_agents 查看。'),
       prompt: z.string().describe('传给目标 Agent 的 Claude Code 的完整 prompt。应当清晰描述需要执行的任务，包括上下文信息。'),
       task_description: z.string().optional().describe('任务的简短描述（人类可读），会在目标 Agent 的状态栏中显示。'),
-      timeout: z.number().int().min(10000).max(600000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 600000 (10分钟)。')
+      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据任务复杂度评估：简单查询/小改动 5-10 分钟，中等重构/测试 15-30 分钟，大型跨文件重构 1-2 小时，全量审计/复杂迁移 2-5 小时。预估不足会导致任务被截断。')
     }
   }, async (args) => {
     try {
@@ -602,7 +602,7 @@ async function main() {
       target_agent: z.string().describe('目标 Agent 的名称或 ID，该 Agent 必须在线且空闲。'),
       prompt: z.string().describe('追问内容或新的指令。会在之前会话的上下文中继续执行。'),
       task_description: z.string().optional().describe('任务的简短描述。'),
-      timeout: z.number().int().min(10000).max(600000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)。')
+      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据追问内容的复杂度评估。继续会话时可参考上一轮的实际执行时长。')
     }
   }, async (args) => {
     try {
