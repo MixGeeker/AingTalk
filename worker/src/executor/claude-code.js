@@ -17,16 +17,36 @@ const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[a-zA-Z]/g;
 
 /**
  * 解析命令的完整路径（node-pty 不自动解析 PATH）
+ * 在进程内搜索 PATH，不 spawn shell，避免 macOS 上 shell 环境与 Node 进程 PATH 不一致
  */
 function resolveCommand(cmd) {
   try {
     if (process.platform === 'win32') {
       const result = execSync(`where ${cmd}`, { encoding: 'utf8', timeout: 5000 }).trim();
-      // where 可能返回多个结果，取第一个
       return result.split('\n')[0].trim();
-    } else {
-      return execSync(`which ${cmd}`, { encoding: 'utf8' }).trim();
     }
+
+    // Unix: 进程内搜索 PATH 目录，不依赖 /bin/sh
+    const pathDirs = (process.env.PATH || '').split(path.delimiter);
+
+    // macOS: 补充 Homebrew 路径（可能不在 GUI 进程 / launchd 的 PATH 中）
+    if (process.platform === 'darwin') {
+      const extra = ['/opt/homebrew/bin', '/usr/local/bin'];
+      for (const p of extra) {
+        if (!pathDirs.includes(p)) pathDirs.push(p);
+      }
+    }
+
+    for (const dir of pathDirs) {
+      if (!dir) continue;
+      const fullPath = path.join(dir, cmd);
+      try {
+        fs.accessSync(fullPath, fs.constants.X_OK);
+        return fullPath;
+      } catch {}
+    }
+
+    return cmd;
   } catch {
     return cmd;
   }
@@ -378,7 +398,12 @@ class ClaudeCodeExecutor extends EventEmitter {
       let stdout = '';
       let stderr = '';
 
-      const child = spawn(this.claudePath, args, {
+      // 解析完整路径，确保 macOS 上不使用 posix_spawnp 搜索 PATH
+      if (!this._resolvedPath) {
+        this._resolvedPath = resolveCommand(this.claudePath);
+      }
+
+      const child = spawn(this._resolvedPath, args, {
         cwd,
         env: { ...process.env, FORCE_COLOR: '0' },
         windowsHide: true
