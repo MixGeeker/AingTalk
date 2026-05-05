@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "postinstall": "node scripts/fix-node-pty.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

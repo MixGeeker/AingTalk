@@ -556,15 +556,15 @@ async function main() {
       // 告知 CC 可以使用 MCP 工具 complete_task 来回报结果
       enhancedPrompt += `\n\n---\n[任务完成指令] 完成上述任务后，请调用 **complete_task** MCP 工具来回报结果。参数：task_id="${taskId}", target_agent="${fromAgentId}", result=<你的结果摘要>。也可以调用 **send_message** 在中途发送进度通知。`;
 
-      // 收集 --file 参数
+      // 注意：不使用 --file 参数传递接收到的文件
+      // --file 会触发 CC 上传文件到 Anthropic 服务器，需要 session token
+      // 文件路径已通过 prompt 注入，CC 可直接用 Read 工具读取本地文件
       const fileArgs = [];
+      // 仅保留外部显式传入的文件（来自 send_task 的 files 参数）
       if (context?.files && Array.isArray(context.files)) {
         for (const f of context.files) {
           if (fs.existsSync(f)) fileArgs.push(f);
         }
-      }
-      for (const cf of contextFiles) {
-        if (fs.existsSync(cf.savedPath)) fileArgs.push(cf.savedPath);
       }
 
       // 创建 Promise（用于等待任务完成，rejection 由 resolveTask 安全处理）
