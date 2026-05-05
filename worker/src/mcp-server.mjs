@@ -20,14 +20,20 @@ console.debug = (...args) => process.stderr.write('[MCP:DEBUG] ' + args.join(' '
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 
 // 加载 CJS 模块
 const require = createRequire(import.meta.url);
 const { SocketClient } = require('./client/socket-client.js');
 const { FileTransfer } = require('./file-handler/file-transfer.js');
+const { ClaudeCodeExecutor } = require('./executor/claude-code.js');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
 const z = require('zod');
+
+const FILE_CHUNK_SIZE = 64 * 1024; // 64KB
 
 // ==================== 配置加载 ====================
 
@@ -44,13 +50,24 @@ function loadConfig() {
       case '-n':
         parsed.name = args[++i];
         break;
+      case '--mode':
+        parsed.mode = args[++i];
+        break;
     }
   }
 
   return {
     serverUrl: parsed.serverUrl || process.env.AINGTALK_SERVER_URL || 'http://localhost:3000',
-    agentName: parsed.name || process.env.AGENT_NAME || os.hostname()
+    agentName: parsed.name || process.env.AGENT_NAME || os.hostname(),
+    mode: parsed.mode || process.env.AINGTALK_MODE || 'full'
   };
+}
+
+/**
+ * 获取 mcp-server.mjs 自身的绝对路径
+ */
+function getOwnPath() {
+  return fileURLToPath(import.meta.url);
 }
 
 // ==================== 主流程 ====================
@@ -88,15 +105,19 @@ async function main() {
   await socketClient.connect();
   console.error('[MCP] Connected to AingTalk Server');
 
-  // 注册为 MCP 类型 Agent
+  const isFullMode = config.mode === 'full';
+  const ownPath = getOwnPath();
+  console.error(`[MCP] Mode: ${config.mode}, Own path: ${ownPath}`);
+
+  // 注册（根据模式选择角色）
   socketClient.register({
     name: config.agentName,
-    role: 'mcp-client',
+    role: isFullMode ? 'worker' : 'mcp-client',
     hostname: os.hostname(),
     platform: process.platform,
     arch: process.arch,
     workDir: process.cwd(),
-    capabilities: ['mcp', 'claude-code'],
+    capabilities: isFullMode ? ['mcp', 'claude-code', 'file-transfer'] : ['mcp'],
     claudeVersion: '',
     ip: '',
     startedAt: new Date().toISOString()
@@ -107,7 +128,7 @@ async function main() {
     const timeout = setTimeout(() => reject(new Error('Registration timeout (15s)')), 15000);
     socketClient.onRegistered((data) => {
       clearTimeout(timeout);
-      console.error(`[MCP] Agent registered: ${data.agentId}`);
+      console.error(`[MCP] Agent registered: ${data.agentId} (${config.mode})`);
       resolve();
     });
   });
@@ -118,6 +139,400 @@ async function main() {
     console.error(`[MCP] Initial agent list: ${agentCache.length} agents`);
   } catch (e) {
     console.error(`[MCP] Failed to get initial agent list: ${e.message}`);
+  }
+
+  // ---- full 模式: 自动生成 .mcp.json ----
+  if (isFullMode) {
+    const mcpJsonPath = path.join(process.cwd(), '.mcp.json');
+    const mcpConfig = {
+      mcpServers: {
+        aingtalk: {
+          type: 'stdio',
+          command: 'node',
+          args: [ownPath, '--server', config.serverUrl, '--mode', 'mcp-only'],
+          env: {
+            AINGTALK_SERVER_URL: config.serverUrl
+          }
+        }
+      }
+    };
+
+    if (!fs.existsSync(mcpJsonPath)) {
+      fs.writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2) + '\n');
+      console.error(`[MCP] 已自动生成 .mcp.json: ${mcpJsonPath}`);
+    } else {
+      console.error(`[MCP] .mcp.json 已存在，跳过自动生成: ${mcpJsonPath}`);
+    }
+  }
+
+  // ==================== Worker 角色 (仅 full 模式) ====================
+
+  // 心跳定时器（仅 full 模式）
+  let heartbeatInterval = null;
+  if (isFullMode) {
+    heartbeatInterval = setInterval(() => {
+      if (socketClient.connected) {
+        socketClient.sendHeartbeat({
+          status: Object.keys(activeTasks).length > 0 ? 'busy' : 'idle',
+          currentTask: Object.keys(activeTasks).length > 0 ? `${Object.keys(activeTasks).length} tasks` : '',
+          cpuUsage: 0,
+          memoryUsage: 0,
+          diskUsage: 0,
+          uptime: process.uptime()
+        });
+      }
+    }, 30000);
+  }
+
+  // Claude Code 执行器（TUI 模式，仅流式输出，不解析文本结果）
+  const claudeExecutor = isFullMode ? new ClaudeCodeExecutor({
+    workDir: process.cwd(),
+    defaultTimeout: 18000000 // 5 小时上限
+  }) : null;
+
+  // 收到文件的追踪: fileId → { name, originalName, savedPath, fromAgent, size, receivedAt }
+  const completedFiles = new Map();
+
+  // 活跃任务 (仅 full 模式): taskId → { ptyProcess, requestId, fromAgentId, sessionId, resolve, reject, resultFile, tempMcpJson }
+  const activeTasks = {};
+
+  // 任务结果目录（仅 full 模式）
+  const taskResultsDir = isFullMode ? path.join(process.cwd(), 'task-results') : null;
+  if (isFullMode && !fs.existsSync(taskResultsDir)) {
+    fs.mkdirSync(taskResultsDir, { recursive: true });
+    console.error(`[MCP] Task results dir: ${taskResultsDir}`);
+  }
+
+  // 待处理收件箱（供 check_inbox MCP 工具查询）
+  const pendingInbox = [];
+
+  // ==================== 工具函数 ====================
+
+  /**
+   * 启动结果文件轮询 — 当 spawned CC 写入结果文件时触发（仅 full 模式）
+   */
+  function watchResultFile(taskId, resultFilePath, timeout) {
+    const startTime = Date.now();
+    const checkInterval = 2000;
+
+    const timer = setInterval(() => {
+      if (!activeTasks[taskId]) {
+        clearInterval(timer);
+        return;
+      }
+
+      if (fs.existsSync(resultFilePath)) {
+        try {
+          const content = fs.readFileSync(resultFilePath, 'utf8').trim();
+          if (content.length > 0) {
+            clearInterval(timer);
+            console.error(`[MCP] 结果文件已写入: ${resultFilePath} (${content.length} chars)`);
+            resolveTask(taskId, content);
+            return;
+          }
+        } catch (err) {
+          console.error(`[MCP] 读取结果文件失败: ${err.message}`);
+        }
+      }
+
+      if (Date.now() - startTime > timeout) {
+        clearInterval(timer);
+        console.error(`[MCP] 等待结果文件超时: ${taskId}`);
+        resolveTask(taskId, null, new Error('等待 Claude Code 结果超时'));
+      }
+    }, checkInterval);
+
+    return timer;
+  }
+
+  /**
+   * 完成任务 — 由结果文件监听或 complete_task MCP 工具触发
+   */
+  function resolveTask(taskId, result, error) {
+    const task = activeTasks[taskId];
+    if (!task) return;
+
+    const { ptyProcess, requestId, fromAgentId, sessionId, resolve, reject, tempMcpJson } = task;
+
+    // 终止 PTY 进程
+    if (ptyProcess) {
+      try { ptyProcess.kill(); } catch {}
+    }
+
+    // 通过 Socket.io 发送完成通知
+    if (requestId) {
+      socketClient.sendClaudeComplete(
+        taskId,
+        error ? -1 : 0,
+        0,
+        result || (error ? error.message : ''),
+        requestId,
+        sessionId
+      );
+    }
+
+    // 发送 task-result 消息给发起方
+    if (fromAgentId && result) {
+      socketClient.sendMessage({
+        to: fromAgentId,
+        type: 'task-result',
+        content: result.substring(0, 500),
+        metadata: {
+          taskId,
+          fullResult: result.length > 500 ? result : undefined,
+          sessionId
+        }
+      });
+    }
+
+    // 恢复/清理临时 .mcp.json
+    if (tempMcpJson) {
+      if (tempMcpJson.backupContent) {
+        fs.writeFileSync(tempMcpJson.path, tempMcpJson.backupContent);
+        console.error(`[MCP] 已恢复 .mcp.json: ${tempMcpJson.path}`);
+      } else {
+        try { fs.unlinkSync(tempMcpJson.path); } catch {}
+        console.error(`[MCP] 已清理临时 .mcp.json: ${tempMcpJson.path}`);
+      }
+    }
+
+    // Resolve/reject send_task 的 Promise
+    if (error) {
+      reject?.(error);
+    } else {
+      resolve?.({ exitCode: 0, duration: 0, summary: result, sessionId, taskId });
+    }
+
+    delete activeTasks[taskId];
+    console.error(`[MCP] 任务完成: ${taskId}`);
+  }
+
+  // ---- 文件接收回调 (仅 full 模式) ----
+
+  if (isFullMode) {
+    socketClient.onFileRequest((data) => {
+      const { fileId, name, size, from } = data;
+      console.error(`[MCP] 收到文件传输请求: ${name} (${size} bytes) 来自 ${from}`);
+
+      const validation = fileTransfer.validateFile(name, size);
+      if (!validation.valid) {
+        console.error(`[MCP] 拒绝文件: ${validation.error}`);
+        socketClient.sendFileResponse(fileId, false);
+        return;
+      }
+
+      try {
+        fileTransfer.receiveFile(fileId, name, Math.ceil(size / FILE_CHUNK_SIZE));
+        socketClient.sendFileResponse(fileId, true);
+        console.error(`[MCP] 已接受文件: ${name}`);
+      } catch (err) {
+        console.error(`[MCP] 文件接收错误: ${err.message}`);
+        socketClient.sendFileResponse(fileId, false);
+      }
+    });
+
+    socketClient.onFileChunk((data) => {
+      const { fileId, index, total, data: chunkData } = data;
+      const result = fileTransfer.handleChunk(fileId, index, chunkData);
+
+      if (result.complete && result.fileInfo) {
+        const { fileId: fid, name, path: savedPath, finalSize } = result.fileInfo;
+        console.error(`[MCP] 文件接收完成: ${name} → ${savedPath} (${finalSize} bytes)`);
+
+        completedFiles.set(fid, {
+          fileId: fid,
+          name: name,
+          savedPath: savedPath,
+          fromAgent: 'unknown',
+          size: finalSize,
+          receivedAt: Date.now()
+        });
+
+        socketClient.sendMessage({
+          type: 'file-notice',
+          content: `文件接收完成: ${name}`,
+          metadata: { fileId: fid, fileName: name, savedPath: savedPath, size: finalSize }
+        });
+      }
+    });
+
+    socketClient.onFileComplete((data) => {
+      const existing = completedFiles.get(data.fileId);
+      if (existing && data.from) {
+        existing.fromAgent = data.from;
+      }
+    });
+  }
+
+  // ---- Claude Code 执行回调 (仅 full 模式) ----
+
+  if (isFullMode) {
+    socketClient.onClaudeExecute(async (data) => {
+      const { taskId, prompt, context, timeout, requestId, fromAgentId, sessionId, resume } = data;
+
+      if (!taskId || !prompt) {
+        console.error('[MCP] Invalid claude:execute payload');
+        return;
+      }
+
+      console.error(`[MCP] 收到 Claude Code 执行指令: ${taskId} 来自 ${fromAgentId}`);
+
+      if (!(await claudeExecutor.isAvailable())) {
+        socketClient.sendClaudeOutput(taskId, '错误: Claude Code 不可用\n', 'error');
+        socketClient.sendClaudeComplete(taskId, -1, 0, 'Claude Code 不可用', requestId);
+        return;
+      }
+
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const effectiveSessionId = (resume && sessionId && UUID_RE.test(sessionId))
+        ? sessionId
+        : uuidv4();
+
+      const cwd = context?.cwd || process.cwd();
+      const resultFilePath = path.join(taskResultsDir, `${taskId}.md`);
+
+      // ---- 写入临时 .mcp.json，让 spawned CC 拥有 MCP 工具 ----
+      let tempMcpJson = null;
+      const taskMcpJsonPath = path.join(cwd, '.mcp.json');
+      const taskMcpConfig = {
+        mcpServers: {
+          aingtalk: {
+            type: 'stdio',
+            command: 'node',
+            args: [ownPath, '--server', config.serverUrl, '--mode', 'mcp-only'],
+            env: {
+              AINGTALK_SERVER_URL: config.serverUrl,
+              AINGTALK_TASK_ID: taskId,
+              AINGTALK_TASK_RESULT_FILE: resultFilePath
+            }
+          }
+        }
+      };
+
+      // 备份已有 .mcp.json
+      if (fs.existsSync(taskMcpJsonPath)) {
+        const backupContent = fs.readFileSync(taskMcpJsonPath, 'utf8');
+        tempMcpJson = { path: taskMcpJsonPath, backupContent };
+        console.error(`[MCP] 备份已有 .mcp.json: ${taskMcpJsonPath}`);
+      } else {
+        tempMcpJson = { path: taskMcpJsonPath, backupContent: null };
+      }
+
+      fs.writeFileSync(taskMcpJsonPath, JSON.stringify(taskMcpConfig, null, 2) + '\n');
+      console.error(`[MCP] 已写入任务临时 .mcp.json: ${taskMcpJsonPath}`);
+
+      // ---- 构建增强 prompt ----
+      let enhancedPrompt = prompt;
+
+      // 注入文件上下文
+      const contextFiles = [];
+
+      if (context?.fileIds && Array.isArray(context.fileIds)) {
+        for (const fid of context.fileIds) {
+          const file = completedFiles.get(fid);
+          if (file) contextFiles.push(file);
+        }
+      }
+
+      const cutoff = Date.now() - 10 * 60 * 1000;
+      for (const [, file] of completedFiles) {
+        if (file.fromAgent === fromAgentId && file.receivedAt > cutoff && !contextFiles.find(f => f.fileId === file.fileId)) {
+          contextFiles.push(file);
+        }
+      }
+
+      if (contextFiles.length > 0) {
+        const fileList = contextFiles.map(f =>
+          `- **${f.name}** → \`${f.savedPath}\` (${(f.size / 1024).toFixed(1)} KB, ${Math.round((Date.now() - f.receivedAt) / 1000)}s 前收到)`
+        ).join('\n');
+        enhancedPrompt = `[系统上下文] 以下文件已由 Agent 发送并保存到本地，可直接读取分析：\n${fileList}\n\n---\n\n${prompt}`;
+        console.error(`[MCP] 注入 ${contextFiles.length} 个文件路径到 prompt`);
+      }
+
+      // 告知 CC 可以使用 MCP 工具 complete_task 来回报结果
+      enhancedPrompt += `\n\n---\n[任务完成指令] 完成上述任务后，请调用 **complete_task** MCP 工具来回报结果。参数：task_id="${taskId}", target_agent="${fromAgentId}", result=<你的结果摘要>。也可以调用 **send_message** 在中途发送进度通知。`;
+
+      // 收集 --file 参数
+      const fileArgs = [];
+      if (context?.files && Array.isArray(context.files)) {
+        for (const f of context.files) {
+          if (fs.existsSync(f)) fileArgs.push(f);
+        }
+      }
+      for (const cf of contextFiles) {
+        if (fs.existsSync(cf.savedPath)) fileArgs.push(cf.savedPath);
+      }
+
+      // 创建 Promise
+      let taskResolve, taskReject;
+      new Promise((resolve, reject) => { taskResolve = resolve; taskReject = reject; });
+
+      activeTasks[taskId] = {
+        ptyProcess: null,
+        requestId,
+        fromAgentId,
+        sessionId: effectiveSessionId,
+        resolve: taskResolve,
+        reject: taskReject,
+        resultFile: resultFilePath,
+        tempMcpJson
+      };
+
+      pendingInbox.push({
+        taskId,
+        fromAgent: fromAgentId,
+        prompt: prompt,
+        contextFiles: contextFiles.map(f => ({ name: f.name, savedPath: f.savedPath })),
+        receivedAt: Date.now(),
+        status: 'executing'
+      });
+
+      // 启动结果文件轮询（兜底：万一 CC 没用 complete_task MCP 工具，写文件也行）
+      const watchTimer = watchResultFile(taskId, resultFilePath, timeout || 300000);
+
+      try {
+        const execOptions = {
+          taskId,
+          cwd,
+          timeout: timeout || 300000,
+          files: fileArgs,
+          env: context?.environment || {},
+          sessionId: effectiveSessionId,
+          resume: !!resume,
+          cols: 120,
+          rows: 30
+        };
+
+        for await (const chunk of claudeExecutor.execute(enhancedPrompt, execOptions)) {
+          if (chunk.type === 'pty') {
+            socketClient.sendClaudeOutput(taskId, chunk.data, 'pty');
+          } else if (chunk.type === 'error') {
+            socketClient.sendClaudeOutput(taskId, `错误: ${chunk.data}\n`, 'error');
+          } else if (chunk.type === 'complete') {
+            if (activeTasks[taskId]) {
+              console.error(`[MCP] CC 进程退出，等待结果文件 (10s)...`);
+              await new Promise(r => setTimeout(r, 10000));
+              if (activeTasks[taskId] && fs.existsSync(resultFilePath)) {
+                try {
+                  const content = fs.readFileSync(resultFilePath, 'utf8').trim();
+                  if (content.length > 0) {
+                    resolveTask(taskId, content);
+                  }
+                } catch {}
+              }
+              if (activeTasks[taskId]) {
+                resolveTask(taskId, `Claude Code 已完成 (退出码: ${chunk.exitCode})。`);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`[MCP] Claude Code 执行失败:`, error.message);
+        resolveTask(taskId, null, error);
+      } finally {
+        clearInterval(watchTimer);
+      }
+    });
   }
 
   // ---- Step 2: 创建 MCP Server ----
@@ -230,18 +645,22 @@ async function main() {
     }
   });
 
+  // 已发送文件追踪: targetAgentId → [fileId]
+  const sentFiles = new Map();
+
   // ===== Tool: send_task =====
   mcpServer.registerTool('send_task', {
-    description: '向指定的 Agent 发送任务，让该 Agent 的 Claude Code 执行指定的 prompt。目标 Agent 会在本地启动 Claude Code CLI，流式执行后将结果返回给调用方。适用于让其他机器上的 Claude Code 帮忙分析代码、运行测试、调试问题等跨机器协作场景。',
+    description: '向指定的 Agent 发送任务，让该 Agent 的 Claude Code 执行指定的 prompt。目标 Agent 会在本地启动 Claude Code CLI（TUI 模式），执行完成后通过 MCP 工具将结果返回。支持附带已发送文件的 fileId，让远程 CC 知道文件位置。',
     inputSchema: {
       target_agent: z.string().describe('目标 Agent 的名称或 ID。该 Agent 必须在线且空闲（状态为 online 或 idle）。可通过 list_agents 查看。'),
       prompt: z.string().describe('传给目标 Agent 的 Claude Code 的完整 prompt。应当清晰描述需要执行的任务，包括上下文信息。'),
       task_description: z.string().optional().describe('任务的简短描述（人类可读），会在目标 Agent 的状态栏中显示。'),
-      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据任务复杂度评估：简单查询/小改动 5-10 分钟，中等重构/测试 15-30 分钟，大型跨文件重构 1-2 小时，全量审计/复杂迁移 2-5 小时。预估不足会导致任务被截断。')
+      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据任务复杂度评估：简单查询/小改动 5-10 分钟，中等重构/测试 15-30 分钟，大型跨文件重构 1-2 小时，全量审计/复杂迁移 2-5 小时。预估不足会导致任务被截断。'),
+      file_ids: z.array(z.string()).optional().describe('要关联到此任务的文件 ID 列表。这些 fileId 由 send_file 返回。远程 Claude Code 将被告知这些文件在 received/ 目录下的准确路径。如不指定，会自动附加最近发送到该 Agent 的文件。')
     }
   }, async (args) => {
     try {
-      const { target_agent, prompt, task_description, timeout = 300000 } = args;
+      const { target_agent, prompt, task_description, timeout = 300000, file_ids } = args;
 
       // 查找目标
       const target = (agentCache || []).find(a =>
@@ -265,12 +684,24 @@ async function main() {
       const taskId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
       console.error(`[MCP] Sending task ${taskId} to ${target.name} (${target.id})`);
 
+      // 收集关联文件 IDs
+      let taskFileIds = file_ids || [];
+
+      // 自动附加最近发送的文件
+      if (taskFileIds.length === 0) {
+        const recent = sentFiles.get(target.id) || [];
+        taskFileIds = recent.slice(-10); // 最近 10 个
+        if (taskFileIds.length > 0) {
+          console.error(`[MCP] 自动附加 ${taskFileIds.length} 个已发送文件到任务`);
+        }
+      }
+
       // 发送 task-assign 消息通知
       socketClient.sendMessage({
         to: target.id,
         type: 'task-assign',
         content: task_description || prompt,
-        metadata: { taskId, taskDescription: task_description, prompt, priority: 'high' }
+        metadata: { taskId, taskDescription: task_description, prompt, priority: 'high', fileIds: taskFileIds }
       });
 
       // 发起 Claude Code 执行请求并等待结果
@@ -282,6 +713,7 @@ async function main() {
           context: {
             cwd: target.workDir || process.cwd(),
             files: [],
+            fileIds: taskFileIds,
             environment: {}
           },
           timeout
@@ -301,7 +733,8 @@ async function main() {
                   `退出码: ${result.exitCode}\n` +
                   `耗时: ${((result.duration || 0) / 1000).toFixed(1)}s\n` +
                   `会话ID: ${result.sessionId || '(无)'}\n` +
-                  `摘要: ${result.summary || '(无)'}`
+                  (taskFileIds.length > 0 ? `关联文件: ${taskFileIds.length} 个\n` : '') +
+                  `结果: ${result.summary || '(无)'}`
           }],
           structuredContent: {
             taskId,
@@ -309,7 +742,8 @@ async function main() {
             exitCode: result.exitCode,
             duration: result.duration,
             summary: result.summary,
-            sessionId: result.sessionId || null
+            sessionId: result.sessionId || null,
+            fileIds: taskFileIds
           }
         };
       } catch (execErr) {
@@ -526,15 +960,27 @@ async function main() {
 
       console.error(`[MCP] File sent: ${fileMeta.name} in ${totalDuration}ms (chunks: ${chunkDuration}ms)`);
 
+      // 追踪已发送文件，用于后续 send_task 自动关联
+      if (!sentFiles.has(target.id)) {
+        sentFiles.set(target.id, []);
+      }
+      sentFiles.get(target.id).push(fileMeta.fileId);
+      // 每个 Agent 最多保留 50 条发送记录
+      if (sentFiles.get(target.id).length > 50) {
+        sentFiles.get(target.id).shift();
+      }
+
       return {
         content: [{
           type: 'text',
           text: `文件已成功发送到 **${target.name}**。\n` +
                 `- 文件名: ${fileMeta.name}\n` +
                 `- 大小: ${(fileMeta.size / 1024).toFixed(1)} KB\n` +
+                `- 文件ID: \`${fileMeta.fileId}\`\n` +
                 `- 分块数: ${fileMeta.totalChunks}\n` +
                 `- 总耗时: ${(totalDuration / 1000).toFixed(1)}s\n` +
-                `- 传输耗时: ${(chunkDuration / 1000).toFixed(1)}s` +
+                `- 传输耗时: ${(chunkDuration / 1000).toFixed(1)}s\n` +
+                `\n提示: 在后续 send_task 中，系统会自动将此文件路径告知远程 Agent。也可在 send_task 中显式传入 \`file_ids: ["${fileMeta.fileId}"]\`` +
                 (description ? `\n- 描述: ${description}` : '')
         }],
         structuredContent: {
@@ -602,11 +1048,12 @@ async function main() {
       target_agent: z.string().describe('目标 Agent 的名称或 ID，该 Agent 必须在线且空闲。'),
       prompt: z.string().describe('追问内容或新的指令。会在之前会话的上下文中继续执行。'),
       task_description: z.string().optional().describe('任务的简短描述。'),
-      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据追问内容的复杂度评估。继续会话时可参考上一轮的实际执行时长。')
+      timeout: z.number().int().min(10000).max(18000000).optional().describe('超时时间（毫秒），默认 300000 (5分钟)，最大 18000000 (5小时)。若用户无指定，自行根据追问内容的复杂度评估。继续会话时可参考上一轮的实际执行时长。'),
+      file_ids: z.array(z.string()).optional().describe('要关联到此任务的文件 ID 列表。')
     }
   }, async (args) => {
     try {
-      const { session_id, target_agent, prompt, task_description, timeout = 300000 } = args;
+      const { session_id, target_agent, prompt, task_description, timeout = 300000, file_ids } = args;
 
       // 查找目标
       const target = (agentCache || []).find(a =>
@@ -630,12 +1077,18 @@ async function main() {
       const taskId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
       console.error(`[MCP] Continuing session ${session_id} with task ${taskId} to ${target.name}`);
 
+      let taskFileIds = file_ids || [];
+      if (taskFileIds.length === 0) {
+        const recent = sentFiles.get(target.id) || [];
+        taskFileIds = recent.slice(-10);
+      }
+
       // 发送 task-assign 消息通知
       socketClient.sendMessage({
         to: target.id,
         type: 'task-assign',
         content: task_description || `[继续会话] ${prompt}`,
-        metadata: { taskId, taskDescription: task_description, prompt, priority: 'high', sessionId: session_id }
+        metadata: { taskId, taskDescription: task_description, prompt, priority: 'high', sessionId: session_id, fileIds: taskFileIds }
       });
 
       try {
@@ -646,6 +1099,7 @@ async function main() {
           context: {
             cwd: target.workDir || process.cwd(),
             files: [],
+            fileIds: taskFileIds,
             environment: {}
           },
           timeout,
@@ -667,7 +1121,8 @@ async function main() {
                   `退出码: ${result.exitCode}\n` +
                   `耗时: ${((result.duration || 0) / 1000).toFixed(1)}s\n` +
                   `会话ID: ${result.sessionId || session_id}\n` +
-                  `摘要: ${result.summary || '(无)'}`
+                  (taskFileIds.length > 0 ? `关联文件: ${taskFileIds.length} 个\n` : '') +
+                  `结果: ${result.summary || '(无)'}`
           }],
           structuredContent: {
             taskId,
@@ -675,7 +1130,8 @@ async function main() {
             exitCode: result.exitCode,
             duration: result.duration,
             summary: result.summary,
-            sessionId: result.sessionId || session_id
+            sessionId: result.sessionId || session_id,
+            fileIds: taskFileIds
           }
         };
       } catch (execErr) {
@@ -754,6 +1210,248 @@ async function main() {
     }
   });
 
+  // ===== Tool: complete_task =====
+  mcpServer.registerTool('complete_task', {
+    description: '完成任务并将结果发回给任务发起方。由执行任务的 Claude Code 调用，将执行结果通过 AingTalk Server 路由回 Leader Agent。也同时发送一条 task-result 消息。',
+    inputSchema: {
+      task_id: z.string().describe('要完成的任务 ID（从 claude:execute 事件的 taskId 或增强 prompt 中的任务 ID）。'),
+      result: z.string().describe('任务结果摘要。可以是 Markdown 格式，包含关键发现、文件列表、修改内容等。'),
+      target_agent: z.string().describe('结果发送目标 Agent 的名称或 ID（即任务发起方）。'),
+      files: z.array(z.string()).optional().describe('（可选）要附带到结果中的本地文件路径列表。')
+    }
+  }, async (args) => {
+    try {
+      const { task_id, result, target_agent, files: resultFiles } = args;
+
+      // 查找目标 Agent
+      const target = (agentCache || []).find(a =>
+        a.id === target_agent || a.name === target_agent
+      );
+
+      const targetId = target ? target.id : target_agent;
+
+      // 通过 Socket.io 发送 task-result 消息
+      const sent = socketClient.sendMessage({
+        to: targetId,
+        type: 'task-result',
+        content: result.substring(0, 500),
+        metadata: {
+          taskId: task_id,
+          fullResult: result.length > 500 ? result : undefined,
+          resultFiles: resultFiles || [],
+          completedAt: Date.now()
+        }
+      });
+
+      if (!sent) {
+        return {
+          content: [{ type: 'text', text: '发送结果失败: Socket 未连接。' }],
+          isError: true
+        };
+      }
+
+      // 如果设置了 AINGTALK_TASK_RESULT_FILE 环境变量，写入结果文件（供 full 模式的轮询器捕获）
+      const resultFilePath = process.env.AINGTALK_TASK_RESULT_FILE;
+      if (resultFilePath) {
+        try {
+          const dir = path.dirname(resultFilePath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(resultFilePath, result, 'utf8');
+          console.error(`[MCP] complete_task 写入结果文件: ${resultFilePath}`);
+        } catch (err) {
+          console.error(`[MCP] 写入结果文件失败: ${err.message}`);
+        }
+      }
+
+      // 如果是 full 模式且有本地活跃任务，resolve 它
+      if (typeof resolveTask === 'function' && activeTasks[task_id]) {
+        resolveTask(task_id, result);
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `任务 ${task_id} 结果已发送到 **${target?.name || target_agent}**。\n结果长度: ${result.length} 字符。`
+        }],
+        structuredContent: {
+          success: true,
+          taskId: task_id,
+          targetAgent: target?.name || target_agent,
+          resultLength: result.length
+        }
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `完成任务失败: ${err.message}` }],
+        isError: true
+      };
+    }
+  });
+
+  // ===== Tool: check_inbox =====
+  mcpServer.registerTool('check_inbox', {
+    description: '检查是否有待处理的任务或消息。返回当前工作站在收件箱中的任务列表。用于 Machine B 上的交互式 Claude Code 主动查看有哪些来自其他 Agent 的任务。',
+    inputSchema: {}
+  }, async (_args) => {
+    try {
+      // 清理超过 30 分钟的已完成/过期条目
+      const cutoff = Date.now() - 30 * 60 * 1000;
+      for (let i = pendingInbox.length - 1; i >= 0; i--) {
+        if (pendingInbox[i].receivedAt < cutoff) {
+          pendingInbox.splice(i, 1);
+        }
+      }
+
+      if (pendingInbox.length === 0) {
+        return {
+          content: [{ type: 'text', text: '收件箱为空，没有待处理的任务。' }],
+          structuredContent: { count: 0, tasks: [] }
+        };
+      }
+
+      const tasks = pendingInbox.map(t => ({
+        taskId: t.taskId,
+        fromAgent: t.fromAgent,
+        prompt: t.prompt.substring(0, 200),
+        fileCount: t.contextFiles?.length || 0,
+        filePaths: t.contextFiles?.map(f => f.savedPath) || [],
+        receivedAt: new Date(t.receivedAt).toISOString(),
+        status: t.status
+      }));
+
+      return {
+        content: [{
+          type: 'text',
+          text: `收件箱中共 ${tasks.length} 个任务:\n\n` + tasks.map(t =>
+            `- **${t.taskId}** — 来自 ${t.fromAgent} — ${t.status}\n` +
+            `  Prompt: ${t.prompt}${t.prompt.length > 200 ? '...' : ''}\n` +
+            (t.filePaths.length > 0 ? `  关联文件: ${t.filePaths.join(', ')}\n` : '')
+          ).join('\n')
+        }],
+        structuredContent: { count: tasks.length, tasks }
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `查询收件箱失败: ${err.message}` }],
+        isError: true
+      };
+    }
+  });
+
+  // ===== Tool: get_received_files =====
+  mcpServer.registerTool('get_received_files', {
+    description: '查询当前 Agent 收到的文件列表及其本地路径。返回每个文件的 fileId、名称、保存路径、大小、来源 Agent、接收时间。Claude Code 可据此直接读取文件进行分析。如指定 fileId 则只返回该文件。',
+    inputSchema: {
+      file_id: z.string().optional().describe('（可选）指定文件 ID，只返回该文件的信息。')
+    }
+  }, async (args) => {
+    try {
+      const { file_id } = args || {};
+
+      if (file_id) {
+        const file = completedFiles.get(file_id);
+        if (!file) {
+          // 尝试扫描 received/ 目录
+          const receivedDir = path.join(process.cwd(), 'received');
+          if (fs.existsSync(receivedDir)) {
+            const entries = fs.readdirSync(receivedDir);
+            const match = entries.find(e => e.startsWith(file_id + '_'));
+            if (match) {
+              const fullPath = path.join(receivedDir, match);
+              const stat = fs.statSync(fullPath);
+              return {
+                content: [{
+                  type: 'text',
+                  text: `文件已找到:\n- 名称: ${match.replace(file_id + '_', '')}\n- 路径: \`${fullPath}\`\n- 大小: ${stat.size} bytes`
+                }],
+                structuredContent: {
+                  found: true,
+                  fileId: file_id,
+                  name: match.replace(file_id + '_', ''),
+                  savedPath: fullPath,
+                  size: stat.size
+                }
+              };
+            }
+          }
+          return {
+            content: [{ type: 'text', text: `未找到文件: ${file_id}` }],
+            isError: true
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `文件 **${file.name}**:\n- 路径: \`${file.savedPath}\`\n- 大小: ${(file.size / 1024).toFixed(1)} KB\n- 来源: ${file.fromAgent}\n- 接收时间: ${new Date(file.receivedAt).toISOString()}`
+          }],
+          structuredContent: {
+            found: true,
+            fileId: file.fileId,
+            name: file.name,
+            savedPath: file.savedPath,
+            size: file.size,
+            fromAgent: file.fromAgent,
+            receivedAt: file.receivedAt
+          }
+        };
+      }
+
+      // 返回所有文件
+      const files = Array.from(completedFiles.values());
+      if (files.length === 0) {
+        // 扫描 received/ 目录兜底
+        const receivedDir = path.join(process.cwd(), 'received');
+        if (fs.existsSync(receivedDir)) {
+          const entries = fs.readdirSync(receivedDir);
+          if (entries.length > 0) {
+            const scanned = entries.map(e => {
+              const parts = e.split(/_(.+)/, 2);
+              const fullPath = path.join(receivedDir, e);
+              let size = 0;
+              try { size = fs.statSync(fullPath).size; } catch {}
+              return {
+                fileId: parts[0] || e,
+                name: parts[1] || e,
+                savedPath: fullPath,
+                size,
+                receivedAt: null
+              };
+            });
+            return {
+              content: [{
+                type: 'text',
+                text: `received/ 目录中找到 ${scanned.length} 个文件:\n\n` + scanned.map(f =>
+                  `- **${f.name}** → \`${f.savedPath}\` (${(f.size / 1024).toFixed(1)} KB) — ID: ${f.fileId}`
+                ).join('\n')
+              }],
+              structuredContent: { count: scanned.length, files: scanned }
+            };
+          }
+        }
+        return {
+          content: [{ type: 'text', text: '当前没有接收到的文件。' }],
+          structuredContent: { count: 0, files: [] }
+        };
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: `共 ${files.length} 个已接收文件:\n\n` + files.map(f =>
+            `- **${f.name}** → \`${f.savedPath}\` (${(f.size / 1024).toFixed(1)} KB) — 来自 ${f.fromAgent} — ${new Date(f.receivedAt).toISOString()}`
+          ).join('\n')
+        }],
+        structuredContent: { count: files.length, files: Array.from(completedFiles.values()) }
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `查询已接收文件失败: ${err.message}` }],
+        isError: true
+      };
+    }
+  });
+
   // ---- Step 3: 连接 Stdio 传输 ----
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
@@ -762,17 +1460,15 @@ async function main() {
   console.error('[MCP] Registered tools: list_agents, send_message, send_task, cancel_task, continue_task, send_file, get_agent_info');
 
   // ---- 优雅退出 ----
-  process.on('SIGINT', () => {
+  const shutdown = () => {
     console.error('[MCP] Shutting down...');
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    if (claudeExecutor) claudeExecutor.cancelAll();
     socketClient.disconnect();
     process.exit(0);
-  });
-
-  process.on('SIGTERM', () => {
-    console.error('[MCP] Shutting down...');
-    socketClient.disconnect();
-    process.exit(0);
-  });
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 main().catch((err) => {

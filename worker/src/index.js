@@ -478,7 +478,6 @@ class Worker {
           hasError = true;
         } else if (chunk.type === 'complete') {
           const duration = Date.now() - startTime;
-          const summary = chunk.summary || '';
 
           this.taskSessions.set(taskId, effectiveSessionId);
 
@@ -486,7 +485,7 @@ class Worker {
             taskId,
             chunk.exitCode ?? (hasError ? 1 : 0),
             duration,
-            summary,
+            '', // summary 不再由 PTY 解析提供，结果通过 MCP 工具传递
             requestId,
             effectiveSessionId
           );

@@ -12,8 +12,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const commandExists = require('command-exists');
 
-// ANSI 转义序列正则，用于生成纯文本摘要
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[a-zA-Z]/g;
+// ANSI_RE 已删除 — 不再从 PTY 输出提取纯文本摘要
 
 /**
  * 解析命令的完整路径（node-pty 不自动解析 PATH）
@@ -202,8 +201,6 @@ class ClaudeCodeExecutor extends EventEmitter {
       const duration = Date.now() - startTime;
       this.activeTasks.delete(taskId);
 
-      const idleComplete = outputChunks.find(c => c.type === 'idle-complete');
-
       if (timedOut) {
         this.emit('task:timeout', { taskId, duration });
         yield {
@@ -213,16 +210,6 @@ class ClaudeCodeExecutor extends EventEmitter {
           duration,
           error: '执行超时'
         };
-      } else if (idleComplete) {
-        // TUI 空闲检测：Claude Code 已完成响应
-        this.emit('task:complete', { taskId, duration, exitCode: 0 });
-        yield {
-          type: 'complete',
-          data: '',
-          exitCode: 0,
-          duration,
-          summary: this.#generateSummary(outputChunks)
-        };
       } else {
         const exitChunk = outputChunks.find(c => c.type === 'exit');
         const exitCode = exitChunk?.exitCode ?? 0;
@@ -231,8 +218,7 @@ class ClaudeCodeExecutor extends EventEmitter {
           type: 'complete',
           data: '',
           exitCode,
-          duration,
-          summary: this.#generateSummary(outputChunks)
+          duration
         };
       }
 
@@ -285,7 +271,7 @@ class ClaudeCodeExecutor extends EventEmitter {
     const args = [];
     const { sessionId, resume } = sessionOpts;
 
-    // 不用 -p，保持完整 TUI 模式；跳过权限确认避免卡住
+    // TUI 模式，跳过权限确认。结果由 MCP 工具回报，不解析 PTY 输出
     args.push('--dangerously-skip-permissions');
 
     if (resume && sessionId) {
@@ -312,16 +298,15 @@ class ClaudeCodeExecutor extends EventEmitter {
   /**
    * 收集 PTY 输出（async generator）
    * PTY 只有单一数据流，不区分 stdout/stderr
-   * TUI 模式下 Claude Code 不会自动退出，用空闲检测判断完成
+   * 仅在进程退出时判定完成，不做空闲检测
    * @private
    */
-  #collectPtyOutput(ptyProcess, taskId, timeoutTimer, idleTimeout = 15000) {
+  #collectPtyOutput(ptyProcess, taskId, timeoutTimer) {
     return {
       [Symbol.asyncIterator]() {
         let closed = false;
         let buffer = [];
         let resolveNext = null;
-        let idleTimer = null;
 
         const pushChunk = (chunk) => {
           if (resolveNext) {
@@ -339,37 +324,18 @@ class ClaudeCodeExecutor extends EventEmitter {
           }
         };
 
-        // 重置空闲计时器：每次收到 PTY 数据都重置
-        const resetIdleTimer = () => {
-          if (idleTimer) clearTimeout(idleTimer);
-          idleTimer = setTimeout(() => {
-            if (closed) return;
-            console.log(`[ClaudeCodeExecutor] TUI 空闲 ${idleTimeout / 1000}s，判定任务完成: ${taskId}`);
-            if (timeoutTimer) clearTimeout(timeoutTimer);
-            closed = true;
-            pushChunk({ type: 'idle-complete', taskId });
-            checkDone();
-            try { ptyProcess.kill(); } catch {}
-          }, idleTimeout);
-        };
-
         // PTY 数据事件 — raw terminal bytes
         ptyProcess.onData((data) => {
-          resetIdleTimer();
           pushChunk({ type: 'pty', data, taskId });
         });
 
         // PTY 退出事件
         ptyProcess.onExit(({ exitCode }) => {
           if (timeoutTimer) clearTimeout(timeoutTimer);
-          if (idleTimer) clearTimeout(idleTimer);
           closed = true;
           pushChunk({ type: 'exit', exitCode, taskId });
           checkDone();
         });
-
-        // 启动首次空闲计时
-        resetIdleTimer();
 
         return {
           next() {
@@ -436,29 +402,7 @@ class ClaudeCodeExecutor extends EventEmitter {
     });
   }
 
-  /**
-   * 从 PTY 输出中生成纯文本摘要（去除 ANSI 转义序列）
-   * @private
-   */
-  #generateSummary(chunks) {
-    const raw = chunks
-      .filter(c => c.type === 'pty')
-      .map(c => c.data)
-      .join('');
-
-    const plain = raw.replace(ANSI_RE, '')
-      .replace(/\r\n/g, '\n')
-      .replace(/\r/g, '\n')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l.length > 0)
-      .join(' ');
-
-    if (plain.length > 200) {
-      return plain.substring(plain.length - 200);
-    }
-    return plain;
-  }
+  // #generateSummary 已删除 — 结果由 MCP 工具（complete_task / send_message）传递，不再从 PTY 文本提取
 }
 
 module.exports = { ClaudeCodeExecutor };
