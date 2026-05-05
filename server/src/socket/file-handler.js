@@ -78,6 +78,9 @@ class FileHandler {
         return { success: false, error: 'Target agent is offline' };
       }
 
+      // 存储接收方 socketId，后续 chunk 转发直接使用
+      const receiverSocketId = targetAgent.socketId;
+
       // 计算分块数
       const totalChunks = Math.ceil(size / CHUNK_SIZE);
 
@@ -89,6 +92,8 @@ class FileHandler {
         mimeType,
         from,
         to,
+        senderSocketId: socket.id, // 直接存储发送方 socket，避免 agentId 查找失败
+        receiverSocketId,
         status: 'pending',
         chunksReceived: 0,
         totalChunks,
@@ -148,10 +153,10 @@ class FileHandler {
         // 更新状态为传输中
         agentStore.updateFileTransfer(fileId, { status: 'transferring' });
 
-        // 通知发送方可以开始传输
-        const senderAgent = agentStore.getAgent(transfer.from);
-        if (senderAgent && senderAgent.socketId) {
-          this.io.to(senderAgent.socketId).emit('file:ready', {
+        // 通知发送方可以开始传输（优先用存储的 socketId，回退到 agentId 查找）
+        const senderSocketId = transfer.senderSocketId || agentStore.getAgent(transfer.from)?.socketId;
+        if (senderSocketId) {
+          this.io.to(senderSocketId).emit('file:ready', {
             fileId,
             accepted: true,
             chunkSize: CHUNK_SIZE
@@ -172,9 +177,9 @@ class FileHandler {
         agentStore.updateFileTransfer(fileId, { status: 'rejected' });
 
         // 通知发送方被拒绝
-        const senderAgent = agentStore.getAgent(transfer.from);
-        if (senderAgent && senderAgent.socketId) {
-          this.io.to(senderAgent.socketId).emit('file:rejected', {
+        const senderSocketId = transfer.senderSocketId || agentStore.getAgent(transfer.from)?.socketId;
+        if (senderSocketId) {
+          this.io.to(senderSocketId).emit('file:rejected', {
             fileId,
             reason: response.reason || 'Receiver declined'
           });
@@ -230,10 +235,10 @@ class FileHandler {
       // 发送块确认给发送方
       socket.emit('file:chunk:ack', { fileId, index });
 
-      // 转发块给接收方
-      const receiverAgent = agentStore.getAgent(transfer.to);
-      if (receiverAgent && receiverAgent.socketId) {
-        this.io.to(receiverAgent.socketId).emit('file:chunk', {
+      // 转发块给接收方（优先用存储的 socketId，回退到 agentId 查找）
+      const receiverSocketId = transfer.receiverSocketId || agentStore.getAgent(transfer.to)?.socketId;
+      if (receiverSocketId) {
+        this.io.to(receiverSocketId).emit('file:chunk', {
           fileId,
           index,
           total,
@@ -276,9 +281,9 @@ class FileHandler {
     });
 
     // 通知发送方
-    const senderAgent = agentStore.getAgent(transfer.from);
-    if (senderAgent && senderAgent.socketId) {
-      this.io.to(senderAgent.socketId).emit('file:complete', {
+    const senderSocketId = transfer.senderSocketId || agentStore.getAgent(transfer.from)?.socketId;
+    if (senderSocketId) {
+      this.io.to(senderSocketId).emit('file:complete', {
         fileId,
         success: true,
         name: transfer.name
@@ -286,9 +291,9 @@ class FileHandler {
     }
 
     // 通知接收方
-    const receiverAgent = agentStore.getAgent(transfer.to);
-    if (receiverAgent && receiverAgent.socketId) {
-      this.io.to(receiverAgent.socketId).emit('file:complete', {
+    const receiverSocketId = transfer.receiverSocketId || agentStore.getAgent(transfer.to)?.socketId;
+    if (receiverSocketId) {
+      this.io.to(receiverSocketId).emit('file:complete', {
         fileId,
         success: true,
         name: transfer.name
