@@ -263,10 +263,8 @@ class ClaudeCodeExecutor extends EventEmitter {
 
           try {
             const raw = JSON.parse(line);
-            const events = this.#mapEvent(raw, taskId);
-            for (const event of events) {
-              pushEvent(event);
-            }
+            const event = this.#mapEvent(raw, taskId);
+            if (event) pushEvent(event);
           } catch {
             // 非 JSON 行，作为原始文本
             pushEvent({ type: 'text', data: line, taskId });
@@ -330,63 +328,56 @@ class ClaudeCodeExecutor extends EventEmitter {
 
   /**
    * 将 CC 的 stream-json 事件映射为内部事件格式
-   * 返回事件数组（一个原始事件可能产生多个内部事件）
    * @private
    */
   #mapEvent(raw, taskId) {
     const type = raw.type;
-    const events = [];
 
     // system/init — 会话初始化
-    if (type === 'system' && raw.subtype === 'init') {
-      events.push({ type: 'init', data: { model: raw.model }, taskId });
-      return events;
+    if (type === 'system') {
+      if (raw.subtype === 'init') {
+        return { type: 'init', data: { model: raw.model, tools: raw.tools }, taskId };
+      }
+      return null;
     }
 
-    // assistant — 完整助手消息，content 包含 text 和 tool_use blocks
+    // assistant — 完整助手消息
     if (type === 'assistant') {
       const msg = raw.message || raw;
+      // 提取工具调用和文本
       const content = msg.content || [];
       for (const block of content) {
-        if (block.type === 'text' && block.text) {
-          events.push({ type: 'text', data: block.text, taskId });
-        } else if (block.type === 'tool_use') {
-          events.push({
+        if (block.type === 'tool_use') {
+          return {
             type: 'tool_use',
             data: { name: block.name, id: block.id },
             toolName: block.name,
             input: typeof block.input === 'string' ? block.input : JSON.stringify(block.input, null, 2),
             taskId
-          });
+          };
         }
       }
-      return events;
+      return null; // 纯 assistant 消息由 stream_event 的 text_delta 处理
     }
 
-    // user — 工具执行结果（在 user 消息的 content 里）
-    if (type === 'user') {
-      const msg = raw.message || raw;
-      const content = msg.content || [];
-      for (const block of content) {
-        if (block.type === 'tool_result') {
-          const output = Array.isArray(block.content)
-            ? block.content.map(c => c.text || JSON.stringify(c)).join('\n')
-            : String(block.content || '');
-          events.push({
-            type: 'tool_result',
-            data: { id: block.tool_use_id },
-            toolName: block.toolName || '',
-            output: output.substring(0, 5000),
-            taskId
-          });
-        }
-      }
-      return events;
+    // tool_result — 工具执行结果
+    if (type === 'tool_result') {
+      const content = raw.content;
+      const output = Array.isArray(content)
+        ? content.map(c => c.text || JSON.stringify(c)).join('\n')
+        : String(content || '');
+      return {
+        type: 'tool_result',
+        data: { id: raw.tool_use_id },
+        toolName: raw.toolName || '',
+        output: output.substring(0, 5000),
+        taskId
+      };
     }
 
     // result — 最终结果
     if (type === 'result') {
-      events.push({
+      return {
         type: 'result',
         data: {
           result: raw.result || '',
@@ -395,13 +386,42 @@ class ClaudeCodeExecutor extends EventEmitter {
           durationMs: raw.duration_ms || 0,
           numTurns: raw.num_turns || 0
         },
-        exitCode: raw.is_error ? 1 : 0,
+        exitCode: raw.subtype === 'error' ? 1 : 0,
         taskId
-      });
-      return events;
+      };
     }
 
-    return events;
+    // stream_event — 实时流（文本、工具调用等）
+    if (type === 'stream_event') {
+      const event = raw.event;
+      if (!event) return null;
+
+      // 文本增量
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        return { type: 'text', data: event.delta.text, taskId };
+      }
+
+      // 工具调用开始
+      if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+        return {
+          type: 'tool_use',
+          data: { name: event.content_block.name, id: event.content_block.id },
+          toolName: event.content_block.name,
+          input: '',
+          taskId
+        };
+      }
+
+      // 工具调用增量（累积 input JSON）
+      if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
+        return { type: 'tool_input_delta', data: event.delta.partial_json, taskId };
+      }
+
+      return null;
+    }
+
+    // 忽略其他事件类型
+    return null;
   }
 
   /**

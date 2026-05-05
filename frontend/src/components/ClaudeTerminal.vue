@@ -11,39 +11,86 @@
         <span v-if="agentCpu != null" class="text-[10px] text-slate-500 font-mono">CPU {{ agentCpu }}%</span>
         <span v-if="agentMem != null" class="text-[10px] text-slate-500 font-mono">MEM {{ agentMem }}%</span>
         <span v-if="status === 'running'" class="text-[10px] text-slate-500 font-mono">{{ elapsed }}</span>
+        <span v-if="costDisplay" class="text-[10px] text-yellow-500 font-mono">${{ costDisplay }}</span>
         <span class="text-[10px] px-1.5 py-0.5 rounded" :class="statusBadgeClass">{{ statusLabel }}</span>
       </div>
     </div>
 
-    <!-- xterm.js Container -->
-    <div ref="terminalContainer" class="flex-1 min-h-0" />
+    <!-- 事件流区域 -->
+    <div ref="scrollContainer" class="flex-1 overflow-y-auto px-3 py-2 font-mono text-[12px] leading-5 scroll-smooth">
+      <!-- 空状态 -->
+      <div v-if="events.length === 0" class="text-slate-600 text-xs flex items-center justify-center h-full">
+        等待任务...
+      </div>
+
+      <!-- 事件列表 -->
+      <div v-for="event in events" :key="event.id">
+        <!-- 文本事件 -->
+        <div v-if="event.type === 'text'" class="text-slate-200 whitespace-pre-wrap break-words">{{ event.content }}</div>
+
+        <!-- 工具调用事件 -->
+        <div v-else-if="event.type === 'tool_use'" class="text-cyan-400/80 leading-4">
+          <span class="cursor-pointer hover:text-cyan-300 select-none inline-flex items-center gap-0.5" @click="event.expanded = !event.expanded">
+            <span class="text-[9px]">{{ event.expanded ? '▼' : '▶' }}</span>
+            <span class="text-[11px]">{{ event.toolName }}</span>
+          </span>
+          <div v-if="event.expanded && event.input" class="text-slate-500 text-[10px] ml-2 mt-0.5 whitespace-pre-wrap max-h-32 overflow-y-auto bg-slate-800/50 rounded px-1.5 py-1">
+            {{ event.input }}
+          </div>
+        </div>
+
+        <!-- 工具结果事件 -->
+        <div v-else-if="event.type === 'tool_result'" class="text-emerald-500/70 leading-4">
+          <span class="cursor-pointer hover:text-emerald-300 select-none inline-flex items-center gap-0.5" @click="event.expanded = !event.expanded">
+            <span class="text-[9px]">✓</span>
+            <span class="text-[10px]">{{ event.toolName || 'result' }}</span>
+          </span>
+          <div v-if="event.expanded && event.output" class="text-slate-500 text-[10px] ml-2 mt-0.5 whitespace-pre-wrap max-h-32 overflow-y-auto bg-slate-800/50 rounded px-1.5 py-1">
+            {{ event.output }}
+          </div>
+        </div>
+
+        <!-- 系统事件 -->
+        <div v-else-if="event.type === 'system'" class="text-slate-600 text-[10px] leading-4">
+          {{ event.content }}
+        </div>
+
+        <!-- 错误事件 -->
+        <div v-else-if="event.type === 'error'" class="text-red-400 text-[10px] whitespace-pre-wrap leading-4">
+          {{ event.content }}
+        </div>
+
+        <!-- 任务分隔线 -->
+        <div v-else-if="event.type === 'separator'" class="text-slate-700 text-[10px] leading-4">
+          {{ event.content }}
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useSocketStore } from '@/stores/socket.js'
-import '@xterm/xterm/css/xterm.css'
 
 const props = defineProps({
   agentId: { type: String, required: true }
 })
 
 const store = useSocketStore()
-const terminalContainer = ref(null)
+const scrollContainer = ref(null)
 const status = ref('idle')
 const duration = ref(0)
 const startTime = ref(null)
 const elapsed = ref('00:00')
+const totalCost = ref(0)
+const events = ref([])
 
-let terminal = null
-let fitAddon = null
 let unsubOutput = null
 let unsubComplete = null
 let elapsedTimer = null
 let currentTaskId = null
+let eventCounter = 0
 
 const agentName = computed(() => {
   const agent = store.agents.find(a => a.id === props.agentId)
@@ -65,6 +112,11 @@ const agentCpu = computed(() => {
 const agentMem = computed(() => {
   const agent = store.agents.find(a => a.id === props.agentId)
   return agent?.memoryUsage != null ? Math.round(agent.memoryUsage) : null
+})
+
+const costDisplay = computed(() => {
+  if (totalCost.value <= 0) return ''
+  return totalCost.value < 0.01 ? '<0.01' : totalCost.value.toFixed(2)
 })
 
 const statusDotClass = computed(() => {
@@ -114,68 +166,94 @@ function updateElapsed() {
   elapsed.value = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
+function scrollToBottom() {
+  const el = scrollContainer.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function pushEvent(event) {
+  events.value.push({ ...event, id: eventCounter++, expanded: false, timestamp: Date.now() })
+  // 限制事件数量，避免内存溢出
+  if (events.value.length > 5000) {
+    events.value = events.value.slice(-3000)
+  }
+  nextTick(scrollToBottom)
+}
+
 onMounted(() => {
-  terminal = new Terminal({
-    disableStdin: true,
-    cursorBlink: false,
-    fontSize: 13,
-    fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace',
-    theme: {
-      background: '#0f172a',
-      foreground: '#e2e8f0',
-      cursor: '#38bdf8',
-      black: '#1e293b',
-      red: '#ef4444',
-      green: '#22c55e',
-      yellow: '#eab308',
-      blue: '#3b82f6',
-      magenta: '#a855f7',
-      cyan: '#06b6d4',
-      white: '#cbd5e1',
-      brightBlack: '#475569',
-      brightRed: '#f87171',
-      brightGreen: '#4ade80',
-      brightYellow: '#facc15',
-      brightBlue: '#60a5fa',
-      brightMagenta: '#c084fc',
-      brightCyan: '#22d3ee',
-      brightWhite: '#f8fafc'
-    },
-    allowProposedApi: true,
-    scrollback: 10000
-  })
-
-  fitAddon = new FitAddon()
-  terminal.loadAddon(fitAddon)
-  terminal.open(terminalContainer.value)
-
-  requestAnimationFrame(() => fitAddon.fit())
-
-  // Only process output for THIS agent
   unsubOutput = store.onClaudeOutput((data) => {
     if (!data?.chunk) return
     if (data.agentId && data.agentId !== props.agentId) return
 
-    // New task starting — write separator
+    // 新任务开始
     if (data.taskId && data.taskId !== currentTaskId) {
       if (currentTaskId) {
-        terminal.writeln('')
+        pushEvent({ type: 'separator', content: '─'.repeat(40) })
       }
       currentTaskId = data.taskId
       status.value = 'running'
       startTime.value = Date.now()
+      totalCost.value = 0
       if (elapsedTimer) clearInterval(elapsedTimer)
       elapsedTimer = setInterval(updateElapsed, 250)
 
-      terminal.writeln(`\x1b[33m─── 任务 ${data.taskId.slice(-8)} 开始 (${fmtTime(Date.now())}) ───\x1b[0m`)
+      pushEvent({ type: 'separator', content: `─── 任务 ${data.taskId.slice(-8)} 开始 (${fmtTime(Date.now())}) ───` })
     }
 
-    terminal.write(data.chunk)
+    // 解析结构化事件
+    try {
+      const event = JSON.parse(data.chunk)
+      switch (event.type) {
+        case 'text':
+          // 合并连续的文本事件
+          const last = events.value[events.value.length - 1]
+          if (last && last.type === 'text' && !last.sealed) {
+            last.content += event.data || ''
+          } else {
+            if (last && last.type === 'text') last.sealed = true
+            pushEvent({ type: 'text', content: event.data || '' })
+          }
+          break
+
+        case 'init':
+          pushEvent({ type: 'system', content: `会话初始化: ${event.data?.model || 'unknown'}` })
+          break
+
+        case 'tool_use':
+          // 封印上一个文本事件（工具调用前文本已结束）
+          const prevText = events.value[events.value.length - 1]
+          if (prevText && prevText.type === 'text') prevText.sealed = true
+          pushEvent({
+            type: 'tool_use',
+            toolName: event.toolName || event.data?.name || 'unknown',
+            input: event.input || ''
+          })
+          break
+
+        case 'tool_result':
+          pushEvent({
+            type: 'tool_result',
+            toolName: event.toolName || '',
+            output: event.output || ''
+          })
+          break
+
+        case 'error':
+          pushEvent({ type: 'error', content: event.data || '未知错误' })
+          break
+
+        default:
+          // 忽略其他类型
+          break
+      }
+    } catch {
+      // 降级：纯文本显示
+      pushEvent({ type: 'text', content: data.chunk, sealed: true })
+    }
   })
 
   unsubComplete = store.onClaudeComplete((data) => {
     if (!data) return
-    // Only handle completions for this agent's tasks
     if (data.agentId && data.agentId !== props.agentId) return
     if (data.taskId !== currentTaskId) return
 
@@ -190,29 +268,15 @@ onMounted(() => {
     updateElapsed()
 
     const label = status.value === 'success' ? '完成' : '失败'
-    terminal.writeln('')
-    terminal.writeln(`\x1b[90m─── ${label} (exit: ${exitCode}, ${fmtDuration(duration.value)}) ───\x1b[0m`)
+    pushEvent({ type: 'separator', content: `─── ${label} (exit: ${exitCode}, ${fmtDuration(duration.value)}) ───` })
 
     currentTaskId = null
   })
-
-  // Resize handling
-  const resizeObserver = new ResizeObserver(() => {
-    if (fitAddon) {
-      requestAnimationFrame(() => fitAddon.fit())
-    }
-  })
-  resizeObserver.observe(terminalContainer.value)
-  terminal._resizeObserver = resizeObserver
 })
 
 onUnmounted(() => {
   if (elapsedTimer) clearInterval(elapsedTimer)
   if (unsubOutput) unsubOutput()
   if (unsubComplete) unsubComplete()
-  if (terminal) {
-    if (terminal._resizeObserver) terminal._resizeObserver.disconnect()
-    terminal.dispose()
-  }
 })
 </script>
