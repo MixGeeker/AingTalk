@@ -1,7 +1,12 @@
 /**
  * ClaudeCodeExecutor - Claude Code CLI 执行器
  * 使用 cross-spawn 运行 CC 的 -p --output-format stream-json 模式
- * 解析 NDJSON 事件流，yield 结构化事件
+ * 解析 NDJSON 事件流，yield 统一的 wire format 事件 { kind, data, taskId }
+ *
+ * yield 出的事件 kind ∈ {init, thinking, text, tool_use, tool_result, result,
+ *                        error, stderr, complete}
+ *   - 前 8 种与 event-encoder 的 wire format 一一对应（直接 encodeEvent 转发）
+ *   - complete 是执行器内部进程退出标记，不在 wire format 内，调用方自行处理
  */
 
 const spawn = require('cross-spawn');
@@ -9,6 +14,7 @@ const { EventEmitter } = require('events');
 const fs = require('fs');
 const path = require('path');
 const commandExists = require('command-exists');
+const { mapRawCcEvent } = require('./event-encoder');
 
 class ClaudeCodeExecutor extends EventEmitter {
   constructor(options = {}) {
@@ -85,14 +91,14 @@ class ClaudeCodeExecutor extends EventEmitter {
     } = options;
 
     if (!(await this.isAvailable())) {
-      yield { type: 'error', data: 'Claude Code 不可用，请确保已安装 claude 命令' };
-      yield { type: 'complete', data: null, exitCode: -1, duration: 0 };
+      yield { kind: 'error', data: { message: 'Claude Code 不可用，请确保已安装 claude 命令' }, taskId };
+      yield { kind: 'complete', data: null, exitCode: -1, duration: 0, taskId };
       return;
     }
 
     if (!fs.existsSync(cwd)) {
-      yield { type: 'error', data: `工作目录不存在: ${cwd}` };
-      yield { type: 'complete', data: null, exitCode: -1, duration: 0 };
+      yield { kind: 'error', data: { message: `工作目录不存在: ${cwd}` }, taskId };
+      yield { kind: 'complete', data: null, exitCode: -1, duration: 0, taskId };
       return;
     }
 
@@ -133,7 +139,7 @@ class ClaudeCodeExecutor extends EventEmitter {
       let finalResult = null;
 
       for await (const event of iterator) {
-        if (event.type === 'result') {
+        if (event.kind === 'result') {
           finalResult = event;
         }
         yield event;
@@ -144,12 +150,12 @@ class ClaudeCodeExecutor extends EventEmitter {
 
       if (timedOut) {
         this.emit('task:timeout', { taskId, duration });
-        yield { type: 'complete', data: null, exitCode: -1, duration, error: '执行超时' };
+        yield { kind: 'complete', data: null, exitCode: -1, duration, error: '执行超时', taskId };
       } else {
-        const exitCode = finalResult?.exitCode ?? 0;
+        const exitCode = finalResult?.data?.isError ? 1 : 0;
         const resultData = finalResult?.data || null;
         this.emit('task:complete', { taskId, duration, exitCode });
-        yield { type: 'complete', data: resultData, exitCode, duration };
+        yield { kind: 'complete', data: resultData, exitCode, duration, taskId };
       }
 
     } catch (error) {
@@ -159,8 +165,8 @@ class ClaudeCodeExecutor extends EventEmitter {
       console.error(`[ClaudeCodeExecutor] 任务 ${taskId} 执行失败:`, error.message);
       this.emit('task:error', { taskId, error: error.message, duration });
 
-      yield { type: 'error', data: error.message };
-      yield { type: 'complete', data: null, exitCode: -1, duration, error: error.message };
+      yield { kind: 'error', data: { message: error.message }, taskId };
+      yield { kind: 'complete', data: null, exitCode: -1, duration, error: error.message, taskId };
     }
   }
 
@@ -230,16 +236,17 @@ class ClaudeCodeExecutor extends EventEmitter {
   /**
    * 解析 NDJSON 流（async generator）
    * CC 的 stream-json 每行输出一个 JSON 事件
+   * 输出统一为 { kind, data, taskId } 形式
    * @private
    */
   #parseNDJSON(child, taskId, timeoutTimer) {
+    const self = this;
     return {
       [Symbol.asyncIterator]() {
         let buffer = '';
         let closed = false;
-        let exitCode = 0;
         let resolveNext = null;
-        let queue = [];
+        const queue = [];
 
         const pushEvent = (event) => {
           if (resolveNext) {
@@ -263,13 +270,13 @@ class ClaudeCodeExecutor extends EventEmitter {
 
           try {
             const raw = JSON.parse(line);
-            const events = this.#mapEvent(raw, taskId);
+            const events = self.#mapEvent(raw, taskId);
             for (const event of events) {
               pushEvent(event);
             }
           } catch {
-            // 非 JSON 行，作为原始文本
-            pushEvent({ type: 'text', data: line, taskId });
+            // 非 JSON 行 → stderr 通道（避免和真正的 assistant text 混淆）
+            pushEvent({ kind: 'stderr', data: { text: line }, taskId });
           }
         };
 
@@ -283,15 +290,17 @@ class ClaudeCodeExecutor extends EventEmitter {
           }
         });
 
-        // stderr — CC 的调试日志，直接转发
+        // stderr — CC 的调试日志，作为 stderr 事件转发（前端可折叠）
         child.stderr.on('data', (data) => {
           const text = data.toString();
-          // 只在调试时输出，不作为事件转发
-          console.error(`[CC stderr] ${text.trim()}`);
+          if (text.trim()) {
+            pushEvent({ kind: 'stderr', data: { text: text.replace(/\r?\n$/, '') }, taskId });
+            console.error(`[CC stderr] ${text.trim()}`);
+          }
         });
 
         // 进程退出
-        child.on('close', (code) => {
+        child.on('close', () => {
           if (timeoutTimer) clearTimeout(timeoutTimer);
 
           // 处理 buffer 中剩余的数据
@@ -300,13 +309,12 @@ class ClaudeCodeExecutor extends EventEmitter {
             buffer = '';
           }
 
-          exitCode = code ?? 0;
           closed = true;
           checkDone();
         });
 
         child.on('error', (err) => {
-          pushEvent({ type: 'error', data: err.message, taskId });
+          pushEvent({ kind: 'error', data: { message: err.message }, taskId });
           closed = true;
           checkDone();
         });
@@ -329,79 +337,13 @@ class ClaudeCodeExecutor extends EventEmitter {
   }
 
   /**
-   * 将 CC 的 stream-json 事件映射为内部事件格式
-   * 返回事件数组（一个原始事件可能产生多个内部事件）
+   * 将 CC 的 stream-json 事件映射为 wire format 事件 { kind, data, taskId }
+   * 委托给 event-encoder.mapRawCcEvent，仅追加 taskId 字段
    * @private
    */
   #mapEvent(raw, taskId) {
-    const type = raw.type;
-    const events = [];
-
-    // system/init — 会话初始化
-    if (type === 'system' && raw.subtype === 'init') {
-      events.push({ type: 'init', data: { model: raw.model }, taskId });
-      return events;
-    }
-
-    // assistant — 完整助手消息，content 包含 text 和 tool_use blocks
-    if (type === 'assistant') {
-      const msg = raw.message || raw;
-      const content = msg.content || [];
-      for (const block of content) {
-        if (block.type === 'text' && block.text) {
-          events.push({ type: 'text', data: block.text, taskId });
-        } else if (block.type === 'tool_use') {
-          events.push({
-            type: 'tool_use',
-            data: { name: block.name, id: block.id },
-            toolName: block.name,
-            input: typeof block.input === 'string' ? block.input : JSON.stringify(block.input, null, 2),
-            taskId
-          });
-        }
-      }
-      return events;
-    }
-
-    // user — 工具执行结果（在 user 消息的 content 里）
-    if (type === 'user') {
-      const msg = raw.message || raw;
-      const content = msg.content || [];
-      for (const block of content) {
-        if (block.type === 'tool_result') {
-          const output = Array.isArray(block.content)
-            ? block.content.map(c => c.text || JSON.stringify(c)).join('\n')
-            : String(block.content || '');
-          events.push({
-            type: 'tool_result',
-            data: { id: block.tool_use_id },
-            toolName: block.toolName || '',
-            output: output.substring(0, 5000),
-            taskId
-          });
-        }
-      }
-      return events;
-    }
-
-    // result — 最终结果
-    if (type === 'result') {
-      events.push({
-        type: 'result',
-        data: {
-          result: raw.result || '',
-          sessionId: raw.session_id,
-          totalCostUsd: raw.total_cost_usd || 0,
-          durationMs: raw.duration_ms || 0,
-          numTurns: raw.num_turns || 0
-        },
-        exitCode: raw.is_error ? 1 : 0,
-        taskId
-      });
-      return events;
-    }
-
-    return events;
+    const events = mapRawCcEvent(raw);
+    return events.map(e => ({ ...e, taskId }));
   }
 
   /**

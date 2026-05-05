@@ -11,13 +11,13 @@
     <!-- Terminal grid -->
     <div
       v-else
-      class="grid gap-px bg-slate-800/50 flex-1 min-h-0"
+      class="grid gap-px bg-slate-800/50 flex-1 min-h-0 min-w-0"
       :style="gridStyle"
     >
       <div
         v-for="agent in onlineAgents"
         :key="agent.id"
-        class="flex flex-col min-h-0 bg-slate-900"
+        class="flex flex-col min-h-0 min-w-0 overflow-hidden bg-slate-900"
       >
         <ClaudeTerminal :agent-id="agent.id" />
       </div>

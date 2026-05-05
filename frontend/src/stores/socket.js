@@ -1,6 +1,7 @@
-import { ref, computed } from 'vue'
+import { ref, computed, shallowRef } from 'vue'
 import { defineStore } from 'pinia'
 import { io } from 'socket.io-client'
+import { TaskAggregator } from '@/utils/claude-stream-parser.js'
 
 export const useSocketStore = defineStore('socket', () => {
   // ========== State ==========
@@ -18,6 +19,25 @@ export const useSocketStore = defineStore('socket', () => {
 
   // Agent terminal sessions: agentId -> { taskId, status, startedAt }
   const agentSessions = ref({})
+
+  // 解析后的任务模型 — 由 TaskAggregator 维护
+  // shallowRef 装容器对象本身：每次有变化时调用 triggerRef 通知响应式系统
+  // 内部对象（Task / events）是非响应式的，避免对大数组深度追踪带来的开销
+  const _aggregator = new TaskAggregator({ maxTasks: 50 })
+  const tasksContainer = shallowRef({ rev: 0 })
+
+  function _bumpTasks() {
+    tasksContainer.value = { rev: tasksContainer.value.rev + 1 }
+  }
+
+  /**
+   * 获取某个 agent 的任务列表（响应式 — 依赖 tasksContainer.value）
+   */
+  function getTasksForAgent(agentId) {
+    // 显式读取 tasksContainer 触发依赖收集
+    void tasksContainer.value.rev
+    return _aggregator.getTasksForAgent(agentId)
+  }
 
   // Claude output callbacks (component-level, not reactive)
   let _claudeOutputCallbacks = []
@@ -179,6 +199,16 @@ export const useSocketStore = defineStore('socket', () => {
         agentSessions.value[data.agentId].taskId = data.taskId
       }
 
+      // 喂给 TaskAggregator
+      if (data?.taskId) {
+        _aggregator.ingestOutput({
+          taskId: data.taskId,
+          agentId: data.agentId,
+          chunk: data.chunk
+        })
+        _bumpTasks()
+      }
+
       _claudeOutputCallbacks.forEach(cb => {
         try { cb(data) } catch (e) {}
       })
@@ -196,6 +226,17 @@ export const useSocketStore = defineStore('socket', () => {
         agentSessions.value[data.agentId].status = 'idle'
         agentSessions.value[data.agentId].lastExitCode = data.exitCode
         agentSessions.value[data.agentId].lastDuration = data.duration
+      }
+
+      // 喂给 TaskAggregator
+      if (data?.taskId) {
+        _aggregator.ingestComplete({
+          taskId: data.taskId,
+          exitCode: data.exitCode,
+          duration: data.duration,
+          sessionId: data.sessionId
+        })
+        _bumpTasks()
       }
 
       _claudeCompleteCallbacks.forEach(cb => {
@@ -247,6 +288,11 @@ export const useSocketStore = defineStore('socket', () => {
     systemStats.value.onlineAgents = onlineAgents.value.length
   }
 
+  function clearAgentTasks(agentId) {
+    _aggregator.clearAgent(agentId)
+    _bumpTasks()
+  }
+
   return {
     // State
     socket,
@@ -257,6 +303,7 @@ export const useSocketStore = defineStore('socket', () => {
     connectionError,
     claudeTasks,
     agentSessions,
+    tasksContainer,
     // Getters
     onlineAgents,
     // Actions
@@ -265,6 +312,8 @@ export const useSocketStore = defineStore('socket', () => {
     joinDashboard,
     cancelClaudeTask,
     onClaudeOutput,
-    onClaudeComplete
+    onClaudeComplete,
+    getTasksForAgent,
+    clearAgentTasks
   }
 })

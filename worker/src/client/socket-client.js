@@ -497,21 +497,41 @@ class SocketClient {
 
   /**
    * 发送 Claude Code 流式输出
+   * 契约：每个 chunk 必须是单行（不含未转义换行符）。如果传入了多行 payload，
+   * 会按行 split 后逐行 emit，避免历史"一个 chunk 多行 JSON 拼接"的烂数据流。
    * @param {string} taskId - 任务 ID
-   * @param {string} chunk - 输出块
-   * @param {string} type - 输出类型 (stdout/stderr/error)
+   * @param {string} chunk - 输出块（应为单行 wire format JSON）
+   * @param {string} type - 输出类型（语义提示，默认 stdout）
    */
   sendClaudeOutput(taskId, chunk, type = 'stdout') {
     if (!this.socket || !this.connected) {
       return false;
     }
 
-    this.socket.emit('claude:output', {
-      taskId,
-      chunk: chunk.toString(),
-      type,
-      agentId: this.agentId
-    });
+    const text = chunk == null ? '' : chunk.toString();
+
+    // 单行快速路径
+    if (text.indexOf('\n') === -1 && text.indexOf('\r') === -1) {
+      this.socket.emit('claude:output', {
+        taskId,
+        chunk: text,
+        type,
+        agentId: this.agentId
+      });
+      return true;
+    }
+
+    // 多行兜底：按行拆分后逐行 emit，丢弃空行
+    const lines = text.split(/\r?\n/);
+    for (const line of lines) {
+      if (line.length === 0) continue;
+      this.socket.emit('claude:output', {
+        taskId,
+        chunk: line,
+        type,
+        agentId: this.agentId
+      });
+    }
     return true;
   }
 

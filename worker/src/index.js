@@ -20,6 +20,7 @@ const { ConfigLoader } = require('./config/loader');
 const { SystemInfoCollector } = require('./collector/system-info');
 const { SocketClient } = require('./client/socket-client');
 const { ClaudeCodeExecutor } = require('./executor/claude-code');
+const { encodeEvent } = require('./executor/event-encoder');
 const { CommandRunner } = require('./executor/command-runner');
 const { FileTransfer, CHUNK_SIZE } = require('./file-handler/file-transfer');
 const { v4: uuidv4 } = require('uuid');
@@ -430,14 +431,14 @@ class Worker {
     // 防止并发执行
     if (this.status === 'busy') {
       console.warn(`[Worker] Already busy, rejecting task ${taskId}`);
-      this.socketClient.sendClaudeOutput(taskId, '错误: Agent 正忙，请稍后再试\n', 'error');
+      this.socketClient.sendClaudeOutput(taskId, encodeEvent('error', { message: 'Agent 正忙，请稍后再试' }), 'error');
       this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Agent busy', requestId);
       return;
     }
 
     // 检查 Claude Code 是否可用
     if (!(await this.claudeExecutor.isAvailable())) {
-      this.socketClient.sendClaudeOutput(taskId, '错误: Claude Code 不可用\n', 'stderr');
+      this.socketClient.sendClaudeOutput(taskId, encodeEvent('error', { message: 'Claude Code 不可用' }), 'error');
       this.socketClient.sendClaudeComplete(taskId, -1, 0, 'Claude Code 不可用', requestId);
       return;
     }
@@ -468,24 +469,32 @@ class Worker {
         resume: !!resume
       };
 
-      // 流式执行
+      // 流式执行 — 统一通过 wire format 转发结构化事件
+      let lastResultSummary = '';
       for await (const chunk of this.claudeExecutor.execute(prompt, options)) {
-        if (chunk.type === 'pty') {
-          // PTY 原始输出 — 直接转发到前端 xterm.js
-          this.socketClient.sendClaudeOutput(taskId, chunk.data, 'pty');
-        } else if (chunk.type === 'error') {
-          this.socketClient.sendClaudeOutput(taskId, `错误: ${chunk.data}\n`, 'error');
+        const kind = chunk.kind;
+        if (!kind) continue;
+
+        // wire format 事件直接编码转发
+        if (kind === 'init' || kind === 'thinking' || kind === 'text' ||
+            kind === 'tool_use' || kind === 'tool_result' ||
+            kind === 'result' || kind === 'stderr') {
+          this.socketClient.sendClaudeOutput(taskId, encodeEvent(kind, chunk.data || {}), kind);
+          if (kind === 'result') {
+            lastResultSummary = chunk.data?.summary || '';
+            if (chunk.data?.isError) hasError = true;
+          }
+        } else if (kind === 'error') {
+          this.socketClient.sendClaudeOutput(taskId, encodeEvent('error', chunk.data || { message: String(chunk.data) }), 'error');
           hasError = true;
-        } else if (chunk.type === 'complete') {
+        } else if (kind === 'complete') {
           const duration = Date.now() - startTime;
-
           this.taskSessions.set(taskId, effectiveSessionId);
-
           this.socketClient.sendClaudeComplete(
             taskId,
             chunk.exitCode ?? (hasError ? 1 : 0),
             duration,
-            '', // summary 不再由 PTY 解析提供，结果通过 MCP 工具传递
+            lastResultSummary,
             requestId,
             effectiveSessionId
           );
@@ -497,7 +506,7 @@ class Worker {
       const duration = Date.now() - startTime;
       console.error(`[Worker] Claude Code 执行失败:`, error.message);
 
-      this.socketClient.sendClaudeOutput(taskId, `执行错误: ${error.message}\n`, 'error');
+      this.socketClient.sendClaudeOutput(taskId, encodeEvent('error', { message: `执行错误: ${error.message}` }), 'error');
       this.socketClient.sendClaudeComplete(taskId, -1, duration, error.message, requestId, effectiveSessionId);
     } finally {
       this.status = 'idle';

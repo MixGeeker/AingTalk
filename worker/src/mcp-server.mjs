@@ -28,6 +28,7 @@ const require = createRequire(import.meta.url);
 const { SocketClient } = require('./client/socket-client.js');
 const { FileTransfer } = require('./file-handler/file-transfer.js');
 const { ClaudeCodeExecutor } = require('./executor/claude-code.js');
+const { encodeEvent } = require('./executor/event-encoder.js');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
@@ -482,7 +483,7 @@ async function main() {
       console.error(`[MCP] 收到 Claude Code 执行指令: ${taskId} 来自 ${fromAgentId}`);
 
       if (!(await claudeExecutor.isAvailable())) {
-        socketClient.sendClaudeOutput(taskId, '错误: Claude Code 不可用\n', 'error');
+        socketClient.sendClaudeOutput(taskId, encodeEvent('error', { message: 'Claude Code 不可用' }), 'error');
         socketClient.sendClaudeComplete(taskId, -1, 0, 'Claude Code 不可用', requestId);
         return;
       }
@@ -607,25 +608,31 @@ async function main() {
           maxTurns: 30
         };
 
+        let lastResultSummary = '';
         for await (const chunk of claudeExecutor.execute(enhancedPrompt, execOptions)) {
-          if (chunk.type === 'text' || chunk.type === 'tool_use' || chunk.type === 'tool_result' || chunk.type === 'init') {
-            // 转发结构化事件给前端
-            socketClient.sendClaudeOutput(taskId, JSON.stringify(chunk), chunk.type);
-          } else if (chunk.type === 'error') {
-            socketClient.sendClaudeOutput(taskId, JSON.stringify({ type: 'error', data: chunk.data }), 'error');
-          } else if (chunk.type === 'result') {
-            // stream-json 的 ResultMessage — CC 已自动退出
-            const result = chunk.data?.result || '';
-            if (result && activeTasks[taskId]) {
-              console.error(`[MCP] CC 返回结果 (${result.length} chars)`);
+          const kind = chunk.kind;
+          if (!kind) continue;
+
+          // wire format 事件：直接编码转发
+          if (kind === 'init' || kind === 'thinking' || kind === 'text' ||
+              kind === 'tool_use' || kind === 'tool_result' ||
+              kind === 'stderr') {
+            socketClient.sendClaudeOutput(taskId, encodeEvent(kind, chunk.data || {}), kind);
+          } else if (kind === 'error') {
+            socketClient.sendClaudeOutput(taskId, encodeEvent('error', chunk.data || { message: String(chunk.data) }), 'error');
+          } else if (kind === 'result') {
+            // 转发 result，并暂存 summary 用于 complete fallback
+            socketClient.sendClaudeOutput(taskId, encodeEvent('result', chunk.data || {}), 'result');
+            lastResultSummary = chunk.data?.summary || '';
+            if (lastResultSummary && activeTasks[taskId]) {
+              console.error(`[MCP] CC 返回结果 (${lastResultSummary.length} chars)`);
             }
-          } else if (chunk.type === 'complete') {
+          } else if (kind === 'complete') {
             // CC 进程已退出，使用结果（来自 result 事件或 complete_task MCP 或结果文件）
             if (activeTasks[taskId]) {
               // 优先级: result 事件 > complete_task MCP > 结果文件兜底
-              const resultFromCC = chunk.data?.result || '';
-              if (resultFromCC) {
-                resolveTask(taskId, resultFromCC);
+              if (lastResultSummary) {
+                resolveTask(taskId, lastResultSummary);
               } else {
                 // 等待 complete_task MCP 或结果文件（watchResultFile 兜底）
                 console.error(`[MCP] CC 退出但无 result 事件，等待 complete_task/结果文件...`);
