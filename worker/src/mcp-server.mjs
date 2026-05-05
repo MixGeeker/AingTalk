@@ -117,7 +117,10 @@ function findSessionToken() {
 
   // 4. macOS Keychain
   if (process.platform === 'darwin') {
-    const keychainNames = ['claude-code', 'Claude Code', 'claude', 'com.anthropic.claude'];
+    const keychainNames = [
+      'claude-code', 'Claude Code', 'claude', 'com.anthropic.claude',
+      'Claude Code CLI', 'com.anthropic.claude-code', 'claude-cli'
+    ];
     for (const name of keychainNames) {
       try {
         const result = require('child_process').execSync(
@@ -127,6 +130,32 @@ function findSessionToken() {
         if (result) {
           console.error(`[MCP] Token 来源: macOS Keychain (${name})`);
           return result;
+        }
+      } catch {}
+    }
+  }
+
+  // 5. ~/Library/Application Support/Claude Code/
+  if (process.platform === 'darwin') {
+    const appSupportDirs = [
+      path.join(os.homedir(), 'Library', 'Application Support', 'Claude Code'),
+      path.join(os.homedir(), 'Library', 'Application Support', 'Claude'),
+      path.join(os.homedir(), 'Library', 'Caches', 'Claude Code'),
+    ];
+    for (const dir of appSupportDirs) {
+      try {
+        if (fs.existsSync(dir)) {
+          const files = fs.readdirSync(dir).filter(f => f.endsWith('.json') || f === '.session');
+          for (const file of files) {
+            try {
+              const content = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+              const token = content.accessToken || content.sessionToken || content.token;
+              if (token && typeof token === 'string' && token.length > 20) {
+                console.error(`[MCP] Token 来源: ${path.join(dir, file)}`);
+                return token;
+              }
+            } catch {}
+          }
         }
       } catch {}
     }
