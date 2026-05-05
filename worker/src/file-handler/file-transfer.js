@@ -21,7 +21,7 @@ class FileTransfer extends EventEmitter {
     this.receivedDir = options.receivedDir || path.join(this.workDir, 'received');
     this.maxFileSize = options.maxFileSize || 104857600; // 100MB
     this.allowedFileTypes = options.allowedFileTypes || [
-      '.zip', '.tar.gz', '.tgz', '.js', '.ts', '.py', '.json',
+      '.zip', '.tar.gz', '.tgz', '.js', '.mjs', '.ts', '.py', '.json',
       '.md', '.txt', '.log', '.yaml', '.yml'
     ];
 

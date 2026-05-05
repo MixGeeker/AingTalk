@@ -15,7 +15,7 @@ const ALLOWED_EXTENSIONS = [
   // 压缩包
   '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z', '.tar.gz', '.tar.bz2',
   // 代码文件
-  '.js', '.ts', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.h',
+  '.js', '.mjs', '.ts', '.py', '.java', '.go', '.rs', '.c', '.cpp', '.h',
   // 数据文件
   '.json', '.xml', '.yaml', '.yml', '.csv', '.sql',
   // 文档

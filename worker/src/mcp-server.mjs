@@ -70,6 +70,72 @@ function getOwnPath() {
   return fileURLToPath(import.meta.url);
 }
 
+/**
+ * 自动发现 Claude Code Session Token
+ * 搜索顺序: 环境变量 → ~/.claude/credentials.json → macOS Keychain
+ */
+function findSessionToken() {
+  // 1. 检查环境变量
+  if (process.env.CLAUDE_CODE_SESSION_ACCESS_TOKEN) {
+    console.error('[MCP] Token 来源: 环境变量 CLAUDE_CODE_SESSION_ACCESS_TOKEN');
+    return process.env.CLAUDE_CODE_SESSION_ACCESS_TOKEN;
+  }
+
+  // 2. 检查 ~/.claude/credentials.json
+  try {
+    const credsPath = path.join(os.homedir(), '.claude', 'credentials.json');
+    if (fs.existsSync(credsPath)) {
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+      const token = creds.accessToken || creds.sessionToken || creds.token;
+      if (token) {
+        console.error('[MCP] Token 来源: ~/.claude/credentials.json');
+        return token;
+      }
+    }
+  } catch (e) {
+    // 继续尝试
+  }
+
+  // 3. 搜索 ~/.claude/ 下所有 JSON 文件
+  try {
+    const claudeDir = path.join(os.homedir(), '.claude');
+    if (fs.existsSync(claudeDir)) {
+      const files = fs.readdirSync(claudeDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        try {
+          const content = JSON.parse(fs.readFileSync(path.join(claudeDir, file), 'utf8'));
+          const token = content.accessToken || content.sessionToken || content.token ||
+                        content.oauthToken || content.credentials?.accessToken;
+          if (token && typeof token === 'string' && token.length > 20) {
+            console.error(`[MCP] Token 来源: ~/.claude/${file}`);
+            return token;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  // 4. macOS Keychain
+  if (process.platform === 'darwin') {
+    const keychainNames = ['claude-code', 'Claude Code', 'claude', 'com.anthropic.claude'];
+    for (const name of keychainNames) {
+      try {
+        const result = require('child_process').execSync(
+          `security find-generic-password -s "${name}" -w 2>/dev/null`,
+          { encoding: 'utf8', timeout: 5000 }
+        ).trim();
+        if (result) {
+          console.error(`[MCP] Token 来源: macOS Keychain (${name})`);
+          return result;
+        }
+      } catch {}
+    }
+  }
+
+  console.error('[MCP] 警告: 未找到 CLAUDE_CODE_SESSION_ACCESS_TOKEN，CC 执行可能会失败');
+  return null;
+}
+
 // ==================== 主流程 ====================
 
 async function main() {
@@ -108,6 +174,15 @@ async function main() {
   const isFullMode = config.mode === 'full';
   const ownPath = getOwnPath();
   console.error(`[MCP] Mode: ${config.mode}, Own path: ${ownPath}`);
+
+  // 自动发现并注入 Claude Code Session Token（后续 spawn CC 时通过 process.env 继承）
+  if (isFullMode) {
+    const token = findSessionToken();
+    if (token) {
+      process.env.CLAUDE_CODE_SESSION_ACCESS_TOKEN = token;
+      console.error('[MCP] CLAUDE_CODE_SESSION_ACCESS_TOKEN 已注入到环境变量');
+    }
+  }
 
   // 注册（根据模式选择角色）
   socketClient.register({
@@ -463,9 +538,10 @@ async function main() {
         if (fs.existsSync(cf.savedPath)) fileArgs.push(cf.savedPath);
       }
 
-      // 创建 Promise
+      // 创建 Promise（用于等待任务完成，rejection 由 resolveTask 安全处理）
       let taskResolve, taskReject;
-      new Promise((resolve, reject) => { taskResolve = resolve; taskReject = reject; });
+      new Promise((resolve, reject) => { taskResolve = resolve; taskReject = reject; })
+        .catch(() => {}); // 防止 unhandled rejection 崩溃进程
 
       activeTasks[taskId] = {
         ptyProcess: null,
