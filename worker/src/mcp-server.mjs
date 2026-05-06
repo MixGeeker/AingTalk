@@ -628,6 +628,16 @@ async function main() {
               console.error(`[MCP] CC 返回结果 (${lastResultSummary.length} chars)`);
             }
           } else if (kind === 'complete') {
+            // 总是先给前端发完成通知（不管 resolveTask 是否被调用）
+            socketClient.sendClaudeComplete(
+              taskId,
+              chunk.exitCode ?? 0,
+              chunk.duration ?? 0,
+              lastResultSummary,
+              requestId,
+              effectiveSessionId
+            );
+
             // CC 进程已退出，使用结果（来自 result 事件或 complete_task MCP 或结果文件）
             if (activeTasks[taskId]) {
               // 优先级: result 事件 > complete_task MCP > 结果文件兜底

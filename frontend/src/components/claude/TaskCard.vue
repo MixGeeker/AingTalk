@@ -126,7 +126,9 @@ const costLabel = computed(() => {
 })
 
 const previewText = computed(() => {
-  // 找到最近一条 text 或 tool_use 的简介
+  // 优先级：report 内容 > 最近 text > 最近 tool_use > dispatch prompt
+  if (props.task.report?.content) return clip(props.task.report.content, 80)
+  if (props.task.summary) return clip(props.task.summary, 80)
   const events = props.task.events
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]
@@ -137,12 +139,50 @@ const previewText = computed(() => {
       return `调用 ${ev.data?.name || 'tool'}`
     }
   }
+  if (props.task.dispatch?.prompt) return '← ' + clip(props.task.dispatch.prompt, 80)
   return ''
 })
 
 const visibleEvents = computed(() => {
-  // 已配对的 tool_result 不单独渲染
-  return props.task.events.filter(e => !(e.kind === 'tool_result' && e.pairedWith))
+  const items = []
+
+  // 头部虚拟事件：来源任务派发
+  if (props.task.dispatch) {
+    items.push({
+      id: `__dispatch_${props.task.id}`,
+      kind: 'task_dispatch',
+      data: props.task.dispatch,
+      ts: props.task.dispatch.ts,
+      raw: ''
+    })
+  }
+
+  // 中段：执行流（已配对的 tool_result 不单独渲染）
+  for (const e of props.task.events) {
+    if (e.kind === 'tool_result' && e.pairedWith) continue
+    items.push(e)
+  }
+
+  // 尾部虚拟事件：任务回报（report 优先，其次 summary）
+  if (props.task.report) {
+    items.push({
+      id: `__report_${props.task.id}`,
+      kind: 'task_report',
+      data: props.task.report,
+      ts: props.task.report.ts,
+      raw: ''
+    })
+  } else if (props.task.summary) {
+    items.push({
+      id: `__report_${props.task.id}`,
+      kind: 'task_report',
+      data: { content: props.task.summary, toAgent: null, fromAgent: null, ts: props.task.endedAt || Date.now() },
+      ts: props.task.endedAt || Date.now(),
+      raw: ''
+    })
+  }
+
+  return items
 })
 
 const rawDump = computed(() => {

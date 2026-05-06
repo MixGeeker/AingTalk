@@ -139,6 +139,40 @@
       </div>
     </template>
 
+    <!-- TASK_DISPATCH（任务来源 — 由 message:new task-assign 注入） -->
+    <template v-else-if="event.kind === 'task_dispatch'">
+      <div class="min-w-0 border border-sky-700/40 bg-sky-950/20 rounded px-2 py-1.5 mb-1">
+        <button
+          class="w-full flex items-baseline gap-1.5 text-sky-300 hover:text-sky-200 min-w-0 text-[11px]"
+          @click="expanded = !expanded"
+        >
+          <span class="text-[9px] flex-shrink-0">{{ expanded ? '▼' : '▶' }}</span>
+          <span class="flex-shrink-0">←</span>
+          <span class="font-medium flex-shrink-0">来源</span>
+          <span v-if="event.data?.fromName" class="text-sky-200/80 flex-shrink-0">{{ event.data.fromName }}</span>
+          <span class="text-slate-400 truncate min-w-0">{{ dispatchPreview }}</span>
+        </button>
+        <div v-if="expanded" class="markdown-body text-[12px] text-slate-200 leading-5 mt-1 break-words" v-html="renderedDispatch"></div>
+      </div>
+    </template>
+
+    <!-- TASK_REPORT（任务回报 — 由 task-result 消息或 result.summary 注入） -->
+    <template v-else-if="event.kind === 'task_report'">
+      <div class="min-w-0 border border-amber-700/40 bg-amber-950/15 rounded px-2 py-1.5 mt-1">
+        <button
+          class="w-full flex items-baseline gap-1.5 text-amber-400 hover:text-amber-300 min-w-0 text-[11px]"
+          @click="expanded = !expanded"
+        >
+          <span class="text-[9px] flex-shrink-0">{{ expanded ? '▼' : '▶' }}</span>
+          <span class="flex-shrink-0">→</span>
+          <span class="font-medium flex-shrink-0">回报</span>
+          <span v-if="event.data?.toAgent" class="text-amber-300/80 flex-shrink-0">{{ shortAgentId(event.data.toAgent) }}</span>
+          <span class="text-slate-400 truncate min-w-0">{{ reportPreview }}</span>
+        </button>
+        <div v-if="expanded" class="markdown-body text-[12px] text-slate-200 leading-5 mt-1 break-words" v-html="renderedReport"></div>
+      </div>
+    </template>
+
     <!-- 兜底：未知 kind -->
     <template v-else>
       <div class="text-[10px] text-slate-500">
@@ -254,6 +288,43 @@ const resultStats = computed(() => {
   const lines = out.split('\n').length
   return `(${lines} 行 · ${formatBytes(bytes)})`
 })
+
+// task_dispatch / task_report 渲染辅助
+const dispatchPreview = computed(() => {
+  const txt = props.event.data?.prompt || ''
+  return clipText(stripMarkdown(txt), 80)
+})
+
+const reportPreview = computed(() => {
+  const txt = props.event.data?.content || ''
+  return clipText(stripMarkdown(txt), 80)
+})
+
+const renderedDispatch = computed(() => {
+  return renderMarkdown(props.event.data?.prompt || '')
+})
+
+const renderedReport = computed(() => {
+  return renderMarkdown(props.event.data?.content || '')
+})
+
+function shortAgentId(id) {
+  if (!id) return ''
+  const s = String(id)
+  return s.length > 8 ? s.slice(0, 8) : s
+}
+
+function stripMarkdown(s) {
+  return String(s)
+    .replace(/[#>*_`~\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function clipText(s, n) {
+  if (!s) return ''
+  return s.length <= n ? s : s.slice(0, n) + '…'
+}
 
 function formatBytes(n) {
   if (n < 1024) return `${n} B`

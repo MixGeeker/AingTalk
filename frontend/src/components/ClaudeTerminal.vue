@@ -12,7 +12,7 @@
         <span v-if="agentMem != null" class="text-[10px] text-slate-500 font-mono flex-shrink-0">MEM {{ agentMem }}%</span>
         <span v-if="hasRunning" class="text-[10px] text-slate-500 font-mono flex-shrink-0">{{ elapsed }}</span>
         <button
-          v-if="tasks.length > 0"
+          v-if="timeline.length > 0"
           class="text-[10px] text-slate-500 hover:text-slate-300 px-1 py-0.5 rounded hover:bg-slate-700/40 flex-shrink-0"
           title="清空当前 Agent 的任务历史"
           @click="onClearTasks"
@@ -21,17 +21,23 @@
       </div>
     </div>
 
-    <!-- 任务列表区 -->
+    <!-- 时间线：Task 与 Message 按时序混排 -->
     <div ref="scrollContainer" class="flex-1 overflow-y-auto overflow-x-hidden px-2 py-2 min-w-0 min-h-0 scroll-smooth">
-      <div v-if="tasks.length === 0" class="text-slate-600 text-xs flex items-center justify-center h-full">
+      <div v-if="timeline.length === 0" class="text-slate-600 text-xs flex items-center justify-center h-full">
         等待任务...
       </div>
-      <TaskCard
-        v-for="task in tasks"
-        :key="task.id"
-        :task="task"
-        :default-expanded="task.status === 'running' || task.id === lastTaskId"
-      />
+      <template v-for="item in timeline" :key="item.id">
+        <TaskCard
+          v-if="item.kind === 'task'"
+          :task="item.task"
+          :default-expanded="item.task.status === 'running' || item.task.id === lastTaskId"
+        />
+        <MessageCard
+          v-else
+          :message="item.msg"
+          :current-agent-id="agentId"
+        />
+      </template>
     </div>
   </div>
 </template>
@@ -40,6 +46,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useSocketStore } from '@/stores/socket.js'
 import TaskCard from './claude/TaskCard.vue'
+import MessageCard from './claude/MessageCard.vue'
 
 const props = defineProps({
   agentId: { type: String, required: true }
@@ -61,7 +68,8 @@ const agentPlatform = computed(() => {
 const agentCpu = computed(() => agent.value?.cpuUsage != null ? Math.round(agent.value.cpuUsage) : null)
 const agentMem = computed(() => agent.value?.memoryUsage != null ? Math.round(agent.value.memoryUsage) : null)
 
-const tasks = computed(() => store.getTasksForAgent(props.agentId))
+const timeline = computed(() => store.getTimelineForAgent(props.agentId))
+const tasks = computed(() => timeline.value.filter(it => it.kind === 'task').map(it => it.task))
 const runningTasks = computed(() => tasks.value.filter(t => t.status === 'running'))
 const hasRunning = computed(() => runningTasks.value.length > 0)
 const lastTaskId = computed(() => tasks.value.length > 0 ? tasks.value[tasks.value.length - 1].id : null)
@@ -121,8 +129,8 @@ function onClearTasks() {
   store.clearAgentTasks(props.agentId)
 }
 
-// 任务列表/状态变化时尝试滚动到底（仅当用户已贴底）
-watch(tasks, () => {
+// 时间线变化时尝试滚动到底（仅当用户已贴底）
+watch(timeline, () => {
   nextTick(() => {
     const el = scrollContainer.value
     if (!el) return

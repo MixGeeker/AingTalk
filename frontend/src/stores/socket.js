@@ -39,6 +39,23 @@ export const useSocketStore = defineStore('socket', () => {
     return _aggregator.getTasksForAgent(agentId)
   }
 
+  /**
+   * 获取某个 agent 的 timeline：把 task 与独立 message 按时序合并
+   * 返回 [{ kind: 'task'|'message', id, ts, task?, msg? }]
+   */
+  function getTimelineForAgent(agentId) {
+    void tasksContainer.value.rev
+    const items = []
+    for (const t of _aggregator.getTasksForAgent(agentId)) {
+      items.push({ kind: 'task', id: 't:' + t.id, ts: t.startedAt || 0, task: t })
+    }
+    for (const m of _aggregator.getMessagesForAgent(agentId)) {
+      items.push({ kind: 'message', id: 'm:' + m.id, ts: m.timestamp || 0, msg: m })
+    }
+    items.sort((a, b) => a.ts - b.ts)
+    return items
+  }
+
   // Claude output callbacks (component-level, not reactive)
   let _claudeOutputCallbacks = []
   let _claudeCompleteCallbacks = []
@@ -221,20 +238,24 @@ export const useSocketStore = defineStore('socket', () => {
         claudeTasks.value[data.taskId].exitCode = data.exitCode
       }
 
-      // Update agent session
-      if (data?.agentId && agentSessions.value[data.agentId]) {
-        agentSessions.value[data.agentId].status = 'idle'
-        agentSessions.value[data.agentId].lastExitCode = data.exitCode
-        agentSessions.value[data.agentId].lastDuration = data.duration
+      // Update agent session — 用 task 的 agentId 兜底（worker 不发 agentId）
+      const taskAgentId = data?.agentId
+        || _aggregator.getTask(data?.taskId)?.agentId
+        || null
+      if (taskAgentId && agentSessions.value[taskAgentId]) {
+        agentSessions.value[taskAgentId].status = 'idle'
+        agentSessions.value[taskAgentId].lastExitCode = data.exitCode
+        agentSessions.value[taskAgentId].lastDuration = data.duration
       }
 
-      // 喂给 TaskAggregator
+      // 喂给 TaskAggregator（含 summary）
       if (data?.taskId) {
         _aggregator.ingestComplete({
           taskId: data.taskId,
           exitCode: data.exitCode,
           duration: data.duration,
-          sessionId: data.sessionId
+          sessionId: data.sessionId,
+          summary: data.summary
         })
         _bumpTasks()
       }
@@ -242,6 +263,13 @@ export const useSocketStore = defineStore('socket', () => {
       _claudeCompleteCallbacks.forEach(cb => {
         try { cb(data) } catch (e) {}
       })
+    })
+
+    // 监听 Agent 间聊天/任务消息（task-assign / task-result / text / btw / etc）
+    socket.value.on('message:new', (msg) => {
+      if (!msg) return
+      _aggregator.ingestMessage(msg)
+      _bumpTasks()
     })
   }
 
@@ -314,6 +342,7 @@ export const useSocketStore = defineStore('socket', () => {
     onClaudeOutput,
     onClaudeComplete,
     getTasksForAgent,
+    getTimelineForAgent,
     clearAgentTasks
   }
 })

@@ -624,6 +624,16 @@ async function main() {
             socketClient.sendClaudeOutput(taskId, encodeEvent('result', chunk.data || {}), 'result');
             lastResultSummary = chunk.data?.summary || '';
           } else if (kind === 'complete') {
+            // 总是先给前端发完成通知
+            socketClient.sendClaudeComplete(
+              taskId,
+              chunk.exitCode ?? 0,
+              chunk.duration ?? 0,
+              lastResultSummary,
+              requestId,
+              effectiveSessionId
+            );
+
             if (activeTasks[taskId]) {
               if (lastResultSummary) {
                 resolveTask(taskId, lastResultSummary);

@@ -458,44 +458,57 @@ function safeJsonStringify(v) {
 // ============================================================================
 
 /**
- * 任务聚合器：维护 taskId → Task 的映射
+ * 任务聚合器：维护 taskId → Task 的映射，并保存独立消息流
  *
  * 事件入口：
  *   - ingestOutput({ taskId, agentId, chunk })
- *   - ingestComplete({ taskId, exitCode, duration, sessionId })
+ *   - ingestComplete({ taskId, exitCode, duration, sessionId, summary })
+ *   - ingestMessage(msg)  // 来自 socket message:new
  *
  * Task 形状：
  *   {
  *     id, agentId, status: 'running'|'success'|'error',
  *     startedAt, endedAt,
  *     model, sessionId, totalCostUsd, durationMs, numTurns,
- *     events: [{ id, kind, data, ts, raw }],
+ *     summary,                                // 来自 claude:complete.summary 或 result 事件
+ *     dispatch: { fromAgent, fromName, prompt, ts } | null,  // 来自 task-assign 消息
+ *     report:   { fromAgent, toAgent, content, ts } | null,  // 来自 task-result 消息
+ *     events: [{ id, kind, data, ts, raw, result?, pairedWith? }],
  *     rawLines: [string]
  *   }
  *
- * 事件后处理：
- *   - 同 messageId 的连续 text 在拉取 Task.events 时合并
- *   - tool_use 与 tool_result 通过 toolUseId 在 events 中互相挂钩
+ * Message 形状（独立聊天）：
+ *   { id, type, from, to, fromName, content, metadata, timestamp }
+ *
+ * 响应式策略：
+ *   每次有变更（ingestOutput/Complete/Message/_appendEvent）后，对受影响的 task
+ *   执行 _commit(task) — 浅克隆 task 与 events 数组，使引用变化触发 Vue v-for 子组件重渲染。
+ *   text / thinking 合并时也对最后一个 event 替换为新对象，避免 EventRow computed 缓存。
+ *   rawLines 不克隆（"全原始"按钮一次性读取，不需要响应式追踪）。
  */
 export class TaskAggregator {
-  constructor({ maxTasks = 50, maxRawLinesPerTask = 5000 } = {}) {
+  constructor({ maxTasks = 50, maxRawLinesPerTask = 5000, maxMessages = 500 } = {}) {
     this._tasks = new Map() // taskId -> Task
     this._order = []        // 插入顺序的 taskId 数组
     this._parsers = new Map() // taskId -> ChunkParser
     this._eventCounter = 0
+    this._messages = []     // 独立 MessageItem 数组
+    this._messageCounter = 0
+    this._pendingDispatch = new Map() // taskId -> dispatch payload（消息先到的兜底）
+    this._pendingReport = new Map()   // taskId -> report payload
     this.maxTasks = maxTasks
     this.maxRawLinesPerTask = maxRawLinesPerTask
+    this.maxMessages = maxMessages
   }
 
   /**
    * 处理一个 claude:output 事件
-   * @returns {Task | null} 受影响的 Task（用于触发响应式更新），不存在则 null
    */
   ingestOutput({ taskId, agentId, chunk }) {
     if (!taskId) return null
-    const task = this._ensureTask(taskId, agentId)
+    let task = this._ensureTask(taskId, agentId)
 
-    // 保留原始 chunk（用于"全展开原始"按钮）
+    // rawLines 不参与响应式（mutate 即可）
     if (task.rawLines.length < this.maxRawLinesPerTask) {
       task.rawLines.push(typeof chunk === 'string' ? chunk : String(chunk))
     }
@@ -508,26 +521,95 @@ export class TaskAggregator {
 
     const events = parser.parseChunk(chunk)
     for (const ev of events) {
-      this._appendEvent(task, ev)
+      task = this._appendEvent(task, ev)
     }
     task.lastChunkAt = Date.now()
-    return task
+    return this._commit(task)
   }
 
   /**
    * 处理一个 claude:complete 事件
    */
-  ingestComplete({ taskId, exitCode, duration, sessionId }) {
+  ingestComplete({ taskId, exitCode, duration, sessionId, summary }) {
     if (!taskId) return null
     const task = this._tasks.get(taskId)
     if (!task) return null
     task.status = exitCode === 0 ? 'success' : 'error'
     task.exitCode = exitCode ?? -1
     task.endedAt = Date.now()
-    if (duration != null) task.durationMs = duration
+    if (duration != null && duration > 0) task.durationMs = duration
     if (sessionId && !task.sessionId) task.sessionId = sessionId
+    if (summary && !task.summary) task.summary = summary
     this._parsers.delete(taskId)
-    return task
+    return this._commit(task)
+  }
+
+  /**
+   * 处理一个 message:new 事件
+   * 路由策略：
+   *   - type === 'task-assign' + metadata.taskId  → 挂到对应 task.dispatch（或 pending）
+   *   - type === 'task-result' + metadata.taskId  → 挂到对应 task.report（或 pending）
+   *   - 其他                                       → 推入独立 _messages
+   *
+   * @param {Object} msg - message 对象（enrichedMessage 形状）
+   * @returns {{ task?: Task, message?: Object }} 哪些被更新了（用于响应式触发）
+   */
+  ingestMessage(msg) {
+    if (!msg || typeof msg !== 'object') return {}
+
+    const type = msg.type
+    const taskId = msg.metadata?.taskId
+
+    if (type === 'task-assign' && taskId) {
+      const dispatch = {
+        fromAgent: msg.from || null,
+        fromName: msg.fromName || msg.from || '',
+        prompt: msg.metadata?.prompt || msg.content || '',
+        ts: msg.timestamp || Date.now()
+      }
+      const task = this._tasks.get(taskId)
+      if (task) {
+        task.dispatch = dispatch
+        return { task: this._commit(task) }
+      } else {
+        this._pendingDispatch.set(taskId, dispatch)
+        return {}
+      }
+    }
+
+    if (type === 'task-result' && taskId) {
+      const report = {
+        fromAgent: msg.from || null,
+        toAgent: msg.to || null,
+        content: msg.metadata?.fullResult || msg.content || '',
+        ts: msg.timestamp || Date.now()
+      }
+      const task = this._tasks.get(taskId)
+      if (task) {
+        task.report = report
+        return { task: this._commit(task) }
+      } else {
+        this._pendingReport.set(taskId, report)
+        return {}
+      }
+    }
+
+    // 独立消息
+    const item = {
+      id: ++this._messageCounter,
+      type: type || 'text',
+      from: msg.from || null,
+      to: msg.to || null,
+      fromName: msg.fromName || msg.from || '',
+      content: msg.content || '',
+      metadata: msg.metadata || {},
+      timestamp: msg.timestamp || Date.now()
+    }
+    this._messages.push(item)
+    while (this._messages.length > this.maxMessages) {
+      this._messages.shift()
+    }
+    return { message: item }
   }
 
   /**
@@ -542,6 +624,20 @@ export class TaskAggregator {
     return list
   }
 
+  /**
+   * 获取与某个 agent 相关的独立消息（from === agentId 或 to === agentId 或 to == null 广播）
+   */
+  getMessagesForAgent(agentId) {
+    if (!agentId) return []
+    const result = []
+    for (const m of this._messages) {
+      if (m.from === agentId || m.to === agentId || m.to == null) {
+        result.push(m)
+      }
+    }
+    return result
+  }
+
   getTask(taskId) {
     return this._tasks.get(taskId) || null
   }
@@ -551,11 +647,14 @@ export class TaskAggregator {
     this._tasks.delete(taskId)
     this._order = this._order.filter(id => id !== taskId)
     this._parsers.delete(taskId)
+    this._pendingDispatch.delete(taskId)
+    this._pendingReport.delete(taskId)
   }
 
   clearAgent(agentId) {
     const toRemove = this._order.filter(id => this._tasks.get(id)?.agentId === agentId)
     for (const id of toRemove) this.removeTask(id)
+    this._messages = this._messages.filter(m => m.from !== agentId && m.to !== agentId && m.to != null)
   }
 
   // ---- 内部 ----
@@ -577,9 +676,23 @@ export class TaskAggregator {
         durationMs: 0,
         numTurns: 0,
         cwd: null,
+        summary: '',
+        dispatch: null,
+        report: null,
         events: [],
         toolUseIndex: new Map(), // toolUseId -> events 数组下标
         rawLines: []
+      }
+      // 合并 pending dispatch/report
+      const pendingD = this._pendingDispatch.get(taskId)
+      if (pendingD) {
+        task.dispatch = pendingD
+        this._pendingDispatch.delete(taskId)
+      }
+      const pendingR = this._pendingReport.get(taskId)
+      if (pendingR) {
+        task.report = pendingR
+        this._pendingReport.delete(taskId)
       }
       this._tasks.set(taskId, task)
       this._order.push(taskId)
@@ -595,6 +708,24 @@ export class TaskAggregator {
     return task
   }
 
+  /**
+   * 把 task 在 _tasks 里替换为浅拷贝（events 数组也浅 slice），返回新引用
+   * 用于触发 Vue 的 props 引用变化检测
+   */
+  _commit(task) {
+    const fresh = {
+      ...task,
+      events: task.events.slice()
+    }
+    this._tasks.set(task.id, fresh)
+    return fresh
+  }
+
+  /**
+   * 追加一个 event。返回处理后的 task 引用（合并/追加都会确保返回最新引用）。
+   * 内部对 text / thinking 合并采用「替换最后一个 event」而非 mutate，
+   * 这样 EventRow 的 props.event 引用变化时 computed 会重算。
+   */
   _appendEvent(task, ev) {
     const id = ++this._eventCounter
     const ts = ev.ts || Date.now()
@@ -609,28 +740,45 @@ export class TaskAggregator {
       task.durationMs = ev.data?.durationMs ?? task.durationMs
       task.numTurns = ev.data?.numTurns ?? task.numTurns
       task.sessionId = ev.data?.sessionId || task.sessionId
+      if (ev.data?.summary) task.summary = ev.data.summary
       if (ev.data?.isError) task.status = 'error'
     }
 
-    // text 合并：同 messageId 的连续 text 直接追加到上一条
+    // text 合并：同 messageId 的连续 text 用「替换最后一个 event」实现
     if (ev.kind === 'text') {
-      const last = task.events[task.events.length - 1]
+      const lastIdx = task.events.length - 1
+      const last = task.events[lastIdx]
       const sameMsg = last && last.kind === 'text' &&
         (last.data?.messageId || null) === (ev.data?.messageId || null)
       if (sameMsg) {
-        last.data.text = (last.data.text || '') + (ev.data?.text || '')
-        last.raw = ev.raw  // 保留最新一条原始 JSON 行（用于查看）
-        return
+        const merged = {
+          ...last,
+          data: {
+            ...last.data,
+            text: (last.data.text || '') + (ev.data?.text || '')
+          },
+          raw: ev.raw || last.raw
+        }
+        task.events[lastIdx] = merged
+        return task
       }
     }
 
-    // thinking 合并：相邻 thinking 也合并（CC 通常会拆分多个 chunk）
+    // thinking 合并：相邻 thinking 同样用替换
     if (ev.kind === 'thinking') {
-      const last = task.events[task.events.length - 1]
+      const lastIdx = task.events.length - 1
+      const last = task.events[lastIdx]
       if (last && last.kind === 'thinking') {
-        last.data.text = (last.data.text || '') + (ev.data?.text || '')
-        last.raw = ev.raw
-        return
+        const merged = {
+          ...last,
+          data: {
+            ...last.data,
+            text: (last.data.text || '') + (ev.data?.text || '')
+          },
+          raw: ev.raw || last.raw
+        }
+        task.events[lastIdx] = merged
+        return task
       }
     }
 
@@ -653,14 +801,17 @@ export class TaskAggregator {
         const useIdx = task.toolUseIndex.get(toolUseId)
         const useEvent = task.events[useIdx]
         if (useEvent) {
-          useEvent.result = entry  // 把 result 挂在对应 tool_use 上（UI 渲染时一起展示）
-          // 同时仍然 push 到 events 末尾用于"严格时序"展示，但带上 paired 标记
+          // 注意：useEvent 当前可能已经被前面的合并替换过引用，但下标始终正确
+          // 给 useEvent 挂 result 也要替换引用，否则 EventRow 看不到
+          const updatedUseEvent = { ...useEvent, result: entry }
+          task.events[useIdx] = updatedUseEvent
           entry.pairedWith = toolUseId
         }
       }
     }
 
     task.events.push(entry)
+    return task
   }
 }
 
